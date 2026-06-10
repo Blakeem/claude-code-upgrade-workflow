@@ -27,6 +27,15 @@ Planner (decompose → plan each task → triage findings → **owns git staging
 (ad-hoc, read-only), Developer (implements + tests, leaves work UNSTAGED), Reviewer (adversarial,
 **diff-only**), Scribe (persists progress, rebuilds ledger). The conductor (JS) sequences them.
 
+Two coverage checks bracket the run (both on the cheap review tier, both default-on):
+- **Plan critic** (`planCritic:false` to disable): after decomposition, an independent agent greps
+  the repo for the goal's change surface and flags material gaps; the Planner amends BEFORE the
+  user approves. Catches misses while they're a plan edit, not a post-run surprise.
+- **Final sweep** (`finalSweep:false` to disable): once EVERY task is done, an independent agent
+  re-greps the surface, runs the FULL gates, spot-checks the staged diff, and writes
+  `runs/<runId>/SWEEP.md`. The per-task loop never looks beyond its own diff — this is the only
+  whole-goal completeness check, so read SWEEP.md before reporting done.
+
 ## The contracts that make it safe — keep them intact
 
 - **Staging = the cycle boundary.** Staged index/HEAD = accepted baseline; the unstaged working
@@ -69,7 +78,8 @@ Planner (decompose → plan each task → triage findings → **owns git staging
    tasks (~1–6 files) and combine test+convert pairs.
 4. **Verify ground truth YOURSELF — do not trust the ledger blindly.** Run the suite/selectors in
    the real environment, inspect the staged diff, confirm changes are additive and the legacy path
-   is intact. The ledger reflects what the agents reported; you confirm reality.
+   is intact. The ledger reflects what the agents reported; you confirm reality. Read `SWEEP.md`
+   (the engine's own completeness check) — it's evidence, not a substitute for your verification.
 5. **Resume** after any stop: re-invoke the same `args` (the loader skips done tasks via
    `runs/<runId>/progress/*.json`), or `resumeFromRunId` for same-session cache replay.
 
@@ -77,7 +87,12 @@ Planner (decompose → plan each task → triage findings → **owns git staging
 
 - **Verify what the test runner actually ran.** Some runners silently mislead — e.g. PHPUnit 4.x's
   CLI runs only the FIRST path argument and ignores the rest, so a multi-file selector gives a
-  false green. Run one file per invocation, or use `--filter`. Always sanity-check the test count.
+  false green. Run one file per invocation, or use `--filter`. The engine asks the Developer to
+  report `tests_run_count` and fails the gate when it's 0 (selector matched nothing), but you
+  should still sanity-check the count yourself.
+- **Custom `agentTypes` must exist in the user's agent registry.** Defaults use the standard
+  workflow subagent (+ built-in `Explore` for research), which always works. Only pass agentTypes
+  the user actually has — an unknown type fails the agent() call.
 - **`git diff` omits brand-new files.** When verifying, also use `git status --porcelain` and read
   new files. (The engine handles this for the reviewer via `git add -N`; you must too.)
 - **A gate-met task that ran out of rounds is still "done".** If you ever bless a task by hand
@@ -95,7 +110,8 @@ Planner (decompose → plan each task → triage findings → **owns git staging
 
 `tasks.json`/`TASKS.md` (the plan) · `progress/<id>.json` (drives resume) · `LEDGER.md` (status
 table) · `NEEDS-DECISION.md` (flagged majors awaiting the user) · `BLOCKERS.md` (hard-stop reason)
-· `CHANGELOG.md` (human summary) · `ADVISORY.md` (rare residual easy-wins). All gitignored.
+· `SWEEP.md` (final completeness sweep: full-suite result + goal-coverage gaps) · `CHANGELOG.md`
+(human summary) · `ADVISORY.md` (rare residual easy-wins). All gitignored.
 
 ## When you're done
 

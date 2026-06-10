@@ -20,6 +20,5 @@
   "reviewSeverity": "high",
   "maxRounds": 3,
   "maxResearch": 2,
-  "models": { "planner": "opus", "research": "sonnet", "develop": "opus", "review": "sonnet", "scribe": "opus" },
-  "agentTypes": { "planner": "opus-senior-dev", "research": "Explore", "develop": "opus-senior-dev", "review": "sonnet-senior-dev", "scribe": "opus-senior-dev" }
+  "models": { "planner": "opus", "research": "sonnet", "develop": "opus", "review": "sonnet", "scribe": "sonnet" }
 }

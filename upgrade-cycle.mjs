@@ -6,11 +6,13 @@ export const meta = {
     { title: 'Load', detail: 'Read the approved task plan + prior progress (resume)' },
     { title: 'Decompose', detail: 'Planner breaks the goal into an ordered, dependency-aware task list (plan phase only)' },
     { title: 'Research', detail: 'Ad-hoc read-only agent answers the Planner\'s open questions before it commits to a plan' },
+    { title: 'Critique', detail: 'Independent critic re-derives the change surface and flags plan coverage gaps (plan phase only)' },
     { title: 'Plan', detail: 'Planner emits a verified, minimal develop-plan for one task; sets tests_required' },
     { title: 'Develop', detail: 'Developer implements minimally + tests, runs gates, leaves changes UNSTAGED' },
     { title: 'Review', detail: 'Adversarial reviewer reads the unstaged git diff only (this cycle\'s scope)' },
     { title: 'Triage', detail: 'Planner routes findings via the decision matrix, stages on accept, hard-stops on a blocker' },
     { title: 'Record', detail: 'Scribe persists per-task progress + CHANGELOG + rebuilds LEDGER' },
+    { title: 'Sweep', detail: 'After ALL tasks are done: independent agent hunts for goal-coverage gaps the plan missed' },
   ],
 };
 
@@ -33,13 +35,13 @@ const SEED       = A.seed ?? [];                            // optional task see
 const MAX_ROUNDS = A.maxRounds ?? 3;                        // fix rounds per task before "needs-attention"
 const MAX_RESEARCH = A.maxResearch ?? 3;                    // research↔re-plan iterations before forcing a plan
 
-const AT = A.agentTypes ?? {
-  planner: 'opus-senior-dev', research: 'Explore', develop: 'opus-senior-dev',
-  review: 'sonnet-senior-dev', scribe: 'opus-senior-dev',
-};
-const M = A.models ?? {
-  planner: 'opus', research: 'sonnet', develop: 'opus', review: 'sonnet', scribe: 'opus',
-};
+// Per-role model tiers + OPTIONAL custom subagent types. By default no agentType is passed, so
+// every role runs as the harness's standard workflow subagent (always available); 'Explore' for
+// research is a Claude Code built-in. Only set an agentType that exists in YOUR agent registry.
+// Scribe work is mechanical (verbatim JSON writes, status tables) — a cheaper tier is deliberate.
+const AT = { research: 'Explore', ...(A.agentTypes ?? {}) };
+const M  = { planner: 'opus', research: 'sonnet', develop: 'opus', review: 'sonnet', scribe: 'sonnet', ...(A.models ?? {}) };
+const roleOpts = (role, extra) => ({ model: M[role], ...(AT[role] ? { agentType: AT[role] } : {}), ...extra });
 
 // Resolve ROOT to an ABSOLUTE path so every agent + `git -C` call is cwd-independent (subagents
 // run with varying working directories, so relative paths would scatter state). Priority:
@@ -50,8 +52,8 @@ let ROOT = (A.root ? String(A.root) : '').replace(/\\/g, '/').replace(/\/+$/, ''
 if (!ROOT) {
   const loc = await agent(
     'Output ONLY the absolute current working directory: run `pwd` and return its path verbatim, nothing else. Read-only — change nothing.',
-    { agentType: AT.research, model: M.research, label: 'locate-root',
-      schema: { type: 'object', required: ['cwd'], properties: { cwd: { type: 'string' } } } },
+    roleOpts('research', { label: 'locate-root',
+      schema: { type: 'object', required: ['cwd'], properties: { cwd: { type: 'string' } } } }),
   );
   ROOT = String(loc?.cwd ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
   log(`root auto-detected: ${ROOT || '(detection failed — falling back to cwd-relative paths)'}`);
@@ -63,7 +65,7 @@ const STATE_DIR  = abs(A.stateDir ?? `runs/${RUN_ID}`);     // <root>/runs/<runI
 
 // Two severity floors. Review surfaces everything >= REVIEW_SEV; everything >= FIX_SEV is
 // fixable IN-LOOP — UNLESS it's a pre-existing business-logic defect (regression risk), which
-// is flagged to NEEDS-DECISION instead. Inverts the code-review PoC (which documented mediums).
+// is flagged to NEEDS-DECISION instead.
 const SEV_RANK   = { low: 1, medium: 2, high: 3, critical: 4 };
 // LEAN policy (deliberate, to save context): this workflow makes the REQUESTED change correct and
 // production-safe — it is NOT a general code review. The reviewer looks only at the diff and
@@ -75,17 +77,19 @@ const REVIEW_SEV = SEV_RANK[A.reviewSeverity ?? (A.fixSeverity ?? 'high')];
 
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
 
-// Test-first reality: the DB is already migrated, so the suite stays RED until conversion is
-// complete. "Done" is therefore per-task, not whole-suite-green:
+// Per-task gate semantics. Some goals keep the WHOLE suite intentionally red mid-run (test-first
+// migrations where the environment/schema already moved ahead of the code), so "done" is judged
+// per-task against its own selector, never whole-suite-green:
 //   green        -> build passes AND this task's (selector-scoped) tests pass
 //   red-baseline -> build passes AND the authored tests FAIL for the expected reason (TDD red step)
 //   build-only   -> build passes; no test pass/fail requirement
-// Build (php -l / lint) must ALWAYS pass — a parse error is never acceptable.
+// Build (lint/compile) must ALWAYS pass — a broken build is never acceptable.
 function gateOk(gx, needTests, dev) {
   if (!dev) return false;
   if (GATES.build && dev.build_passed !== true) return false;       // build/lint must always pass
   if (!GATES.test || gx === 'build-only') return true;
   if (gx === 'red-baseline') return dev.test_outcome === 'failed-expected';
+  if (needTests && dev.tests_run_count === 0) return false;         // selector matched NOTHING — a false green
   return needTests ? dev.test_outcome === 'passed' : true;          // 'green' (no-test tasks pass on build)
 }
 
@@ -174,6 +178,7 @@ const DEVELOP_SCHEMA = {
       description: 'passed = task tests green. failed-expected = red baseline exactly as the test-first task intends. failed-unexpected = failed for a wrong reason (a real defect). not-run = no tests executed.',
     },
     ran_tests: { type: 'boolean' },
+    tests_run_count: { type: 'integer', description: 'how many tests the runner ACTUALLY executed for this task\'s selector. 0 = the selector matched nothing (a false green — the gate fails on it); -1 = the runner reports no count' },
     unstaged_confirmed: { type: 'boolean', description: 'true if changes were left UNSTAGED (git add NOT run)' },
     gate_output: { type: 'string', description: 'tail of failing gate output, or "" if green' },
     notes: { type: 'string' },
@@ -261,6 +266,47 @@ const LOADER_SCHEMA = {
 
 const RECORD_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, tasks_complete: { type: 'integer' } } };
 
+const CRITIQUE_SCHEMA = {
+  type: 'object',
+  required: ['gaps'],
+  properties: {
+    gaps: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['title', 'evidence'],
+        properties: {
+          title: { type: 'string' },
+          evidence: { type: 'string', description: 'file:line hits / grep counts proving the miss — no evidence, no gap' },
+          suggestion: { type: 'string', description: 'fold into task <id> | new task | reorder | split' },
+        },
+      },
+    },
+    notes: { type: 'string' },
+  },
+};
+
+const SWEEP_SCHEMA = {
+  type: 'object',
+  required: ['complete', 'gaps'],
+  properties: {
+    complete: { type: 'boolean', description: 'true if no goal-coverage gaps were found' },
+    gaps: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['title', 'evidence'],
+        properties: {
+          title: { type: 'string' },
+          evidence: { type: 'string', description: 'file:line hits or gate output proving the gap' },
+          suggested_task: { type: 'string', description: 'a one-line follow-up task that would close it' },
+        },
+      },
+    },
+    suite_result: { type: 'string', description: 'observed outcome of running the FULL gates (or why they were not run)' },
+  },
+};
+
 const BASELINE_SCHEMA = {
   type: 'object',
   required: ['clean'],
@@ -342,8 +388,9 @@ RULES:
   importance × complexity is non-trivial (auth, data integrity, money/state mutations, external API contracts);
   FALSE for changes an LLM zero-shots correctly (mechanical, well-patterned). Explain in
   tests_rationale. Unit OR integration — whichever catches the risk most cheaply.
-- TEST-FIRST ORDERING + GATE EXPECTATIONS. The DB is ALREADY migrated, so the suite stays RED
-  until conversion is complete; "done" is per-task, never whole-suite-green. For each KEY/RISKY
+- TEST-FIRST ORDERING + GATE EXPECTATIONS. Some goals keep the whole suite intentionally RED
+  mid-run (e.g. the environment/schema/spec has already moved ahead and the code is catching up) —
+  when the GOAL implies this, "done" is per-task, never whole-suite-green. For each KEY/RISKY
   feature, author its tests BEFORE converting it. Set each task's gate_expectation + test_selector:
     • A test-authoring task → gate_expectation="red-baseline" (build green; the new tests must FAIL
       for the right reason — they ARE the spec the later conversion satisfies).
@@ -364,6 +411,10 @@ RULES:
   the separate red-baseline test task for large/risky features where the failing spec is worth
   reviewing on its own before conversion.
 - READ the actual code to anchor the file lists. Do NOT invent files.
+- INVENTORY THE FULL SURFACE: grep the repo for EVERY occurrence of the patterns/APIs/symbols the
+  GOAL replaces or touches — do NOT extrapolate from a few sample files. Every hit must be covered
+  by some task (or explicitly noted out-of-scope in notes). Record the hit counts in notes so
+  coverage is checkable afterwards.
 - If anything material is uncertain (an ambiguous contract, an unclear precedence rule, how the
   reference solved it), put it in research_requests INSTEAD of guessing. Return empty
   research_requests only when you are confident the plan is trustworthy.
@@ -397,9 +448,9 @@ PROCEDURE:
    proven approach. Where multiple valid implementations exist, apply the DECISION MATRIX and
    record the choice in decision_notes.
 2. Confirm or correct tests_required, gate_expectation (green | red-baseline | build-only), and
-   test_selector for THIS task; if tests are needed, say exactly what to test (tests_plan). Remember
-   the suite is RED until the whole migration lands — a conversion task is green only against its
-   OWN selector; a test-authoring task is "done" when its new tests fail as intended (red-baseline).
+   test_selector for THIS task; if tests are needed, say exactly what to test (tests_plan). If the
+   suite is intentionally red mid-run, a conversion task is green only against its OWN selector;
+   a test-authoring task is "done" when its new tests fail as intended (red-baseline).
 3. If a material uncertainty remains, return it in research_requests (the conductor will fetch an
    answer and call you again). Return empty research_requests when ready to hand off to Develop.
 4. Do NOT modify code in this mode. Return the plan via the schema.
@@ -424,7 +475,7 @@ ${(plan.steps || []).map((s, i) => `  ${i + 1}. ${s}`).join('\n')}
 FILES: ${(plan.files || task.files || []).join(', ')}
 TESTS: ${needTests ? `REQUIRED — ${plan.tests_plan || 'cover the risky path with unit or integration tests'}` : 'not required for this task'}
 GATE EXPECTATION: ${gxLine}
-TEST SELECTOR (scope the test run to THIS task — the rest of the suite is intentionally red until the whole migration lands): ${sel || '(none — run the smallest relevant set)'}
+TEST SELECTOR (scope the test run to THIS task — the rest of the suite may be intentionally red mid-run): ${sel || '(none — run the smallest relevant set)'}
 
 PROCEDURE (IPO):
 0. BASELINE: the accepted baseline is already STAGED. \`git -C ${REPO} diff\` therefore shows only
@@ -439,6 +490,10 @@ PROCEDURE (IPO):
      build: ${GATES.build ?? '(skip — none configured)'}
      test (scope to the selector above when set): ${GATES.test ?? '(skip — none configured)'}
    Set build_passed, and set test_outcome to passed | failed-expected | failed-unexpected | not-run.
+   SANITY-CHECK the runner REALLY executed your tests: set tests_run_count to the count the runner
+   reports (0 = your selector matched NOTHING — that is a FALSE green, fix the selector and re-run;
+   -1 if the runner prints no count). Some runners silently ignore extra path arguments — when in
+   doubt run one file per invocation or use the runner's filter flag.
 3. Do NOT chase whole-suite green — only this task's scoped tests matter. Never weaken/delete tests
    or disable checks. Build/lint must always pass; if you cannot make it pass within scope, leave it
    failing and explain in gate_output.
@@ -469,6 +524,8 @@ Your ONLY job: did THIS change introduce a problem that blocks testing or produc
   • TESTING BLOCKERS — anything that stops the build/tests from running or passing.
   • INTRODUCED PRODUCTION-BLOCKING defects (severity >= ${A.reviewSeverity ?? 'high'}): a real
     correctness/security/data-integrity/api-contract bug or a REGRESSION this diff caused.
+  • INCOMPLETE IMPLEMENTATION — the diff does NOT actually satisfy the task's acceptance (a missed
+    call site, an unconverted branch, a test asserting the wrong behavior). Report as correctness/high.
   • (optional) a genuinely OBVIOUS one-line in-scope improvement to a line THIS diff touched.
 Do NOT report — drop silently — anything that is: pre-existing (not caused by this diff), medium/
 low severity, stylistic, "could be more defensive", speculative, a redesign, or out of the GOAL's
@@ -520,6 +577,75 @@ PROCEDURE:
    • If any verdict.blocking is true: set has_blocker=true (conductor halts the whole run); do NOT
      stage. The working tree is left intact for the user.
 Return everything via the schema.`;
+
+// Lean accept — the common happy path (clean review + gate met). A full triage prompt + opus is
+// wasted when there is nothing to triage; this does the two things that still matter (regression
+// spot-check + staging) on the cheaper review tier.
+const acceptPrompt = (task, round, gateDesc) => `
+You are finalizing an ACCEPT for one task: the reviewer found NOTHING and the gate expectation is
+met. Two jobs only — regression spot-check, then stage.
+${CONTEXT}
+TASK: ${task.id} — ${task.title}   (round ${round})
+GATE: ${gateDesc}
+1. REGRESSION SPOT-CHECK: \`git -C ${REPO} diff --stat\` (this cycle) vs
+   \`git -C ${REPO} diff --staged --stat\` (accepted baseline). Confirm the unstaged changes
+   plausibly belong to THIS task and did not clobber previously-staged work. If something looks
+   regressed, return accepted=false, regression_found=true, and a tight next_fix_plan instead.
+2. STAGE: \`git -C ${REPO} add <the task's changed AND newly-created files>\` (NEVER commit), then
+   confirm \`git -C ${REPO} diff\` is empty for those files.
+Return verdicts=[], accepted=true, staged=true, has_blocker=false via the schema.`;
+
+const critiquePrompt = (tasks) => `
+You are an INDEPENDENT PLAN CRITIC (read-only). A planner decomposed the GOAL into the task list
+below. Your ONLY job is to find what the plan MISSED — not to restyle or re-architect it.
+${CONTEXT}
+PROPOSED TASK LIST:
+${tasks.map((t) => `  - ${t.id} [deps: ${(t.depends_on || []).join(',') || '-'}] gate=${t.gate_expectation || 'green'} files=${(t.files || []).join(', ') || '(discover)'}\n      ${t.title} — ${t.acceptance || ''}`).join('\n')}
+
+PROCEDURE:
+1. Re-derive the change surface YOURSELF: grep the target repo for the patterns/APIs/symbols the
+   GOAL replaces or touches. Do NOT trust the plan's file lists — verify them.
+2. Compare every hit against the task list. Report a gap ONLY for material misses WITHIN the GOAL:
+   an uncovered call site/feature/file, a missing prerequisite (e.g. no test-harness task), a
+   dependency-ordering error, or a task too large for one ~150k-token develop pass.
+3. Do NOT report style preferences, alternative decompositions, or anything beyond the GOAL.
+   An empty gaps list is a GOOD outcome. Do not modify any files.
+Return via the schema with file:line evidence for each gap — no evidence, no gap.`;
+
+const amendPrompt = (tasks, critique) => `
+You are the PLANNER amending your task plan. An independent critic verified it against the actual
+repo and found coverage gaps. Fold the REAL ones in (into an existing task where natural; as a new
+or split task where needed; reorder if a dependency was wrong). REJECT any gap that is out of the
+GOAL's scope and say why in notes.
+${CONTEXT}
+CURRENT PLAN:
+${JSON.stringify(tasks, null, 2)}
+
+CRITIC'S GAPS:
+${critique.gaps.map((g, i) => `  ${i + 1}. ${g.title}\n     evidence: ${g.evidence}\n     suggestion: ${g.suggestion || '(none)'}`).join('\n')}
+
+Return the COMPLETE amended task list via the schema (research_requests=[]). Do NOT write files.`;
+
+const sweepPrompt = (doneIds) => `
+You are the FINAL COMPLETENESS SWEEP. Every task is done and its work is STAGED. Verify, against
+the repo itself, that the GOAL is actually fully achieved — your job is to find what the task plan
+MISSED, not to re-review accepted work.
+${CONTEXT}
+COMPLETED TASKS: ${doneIds.join(', ')}
+
+PROCEDURE (read-only except step 4):
+1. RE-DERIVE the change surface from the GOAL: grep the target repo for every pattern/API/symbol
+   the goal replaces or touches. Any hit that should have been converted but wasn't = a gap.
+2. Run the FULL gates once and record the real outcome:
+     build: ${GATES.build ?? '(none configured)'}
+     test:  ${GATES.test ?? '(none configured)'}
+   If the GOAL implies whole-suite green at the end, a red suite is a gap. If a red tail is
+   expected, say which failures look expected vs surprising.
+3. Spot-check the staged diff (\`git -C ${REPO} diff --staged --stat\`): does it plausibly cover
+   every task's acceptance? Look for suspiciously-untouched areas the GOAL names.
+4. Write ${STATE_DIR}/SWEEP.md: the suite result, then each gap (title + file:line evidence + a
+   suggested follow-up task) — or "No gaps found." Do NOT modify source code, stage, or commit.
+Report ONLY material, in-GOAL gaps — not improvements, not pre-existing issues. Return via the schema.`;
 
 const baselinePrompt = () => `
 You are establishing the git BASELINE for this run in ${REPO}. The staging contract is:
@@ -574,26 +700,45 @@ if (PHASE === 'plan') {
   let research = [];
   let plan = null;
   for (let i = 0; i <= MAX_RESEARCH; i++) {
-    plan = await agent(decomposePrompt(research), {
-      agentType: AT.planner, model: M.planner, schema: DECOMPOSE_SCHEMA,
-      phase: 'Decompose', label: i === 0 ? 'decompose' : `decompose r${i}`,
-    });
+    plan = await agent(decomposePrompt(research), roleOpts('planner', {
+      schema: DECOMPOSE_SCHEMA, phase: 'Decompose', label: i === 0 ? 'decompose' : `decompose r${i}`,
+    }));
     const qs = (plan?.research_requests || []).filter(Boolean);
     if (!qs.length || i === MAX_RESEARCH) break;
     log(`decompose: planner asked ${qs.length} research question(s) (round ${i + 1})`);
     phase('Research');
-    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), {
-      agentType: AT.research, model: M.research, schema: RESEARCH_SCHEMA,
-      phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
-    })));
+    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), roleOpts('research', {
+      schema: RESEARCH_SCHEMA, phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
+    }))));
     research = research.concat(answers.filter(Boolean));
   }
 
-  const tasks = (plan?.tasks || []);
+  let tasks = (plan?.tasks || []);
+
+  // Independent coverage critic: a SECOND agent re-derives the change surface from the repo and
+  // flags material gaps BEFORE the user approves the plan. One planner pass anchors on what it
+  // happened to read; the critic greps the whole surface, so misses get caught while they are
+  // still cheap (a plan edit, not a missed task discovered post-run). Disable with planCritic:false.
+  if (A.planCritic !== false && tasks.length) {
+    phase('Critique');
+    const critique = await agent(critiquePrompt(tasks), roleOpts('review', {
+      schema: CRITIQUE_SCHEMA, phase: 'Critique', label: 'plan-critic',
+    }));
+    if ((critique?.gaps || []).length) {
+      log(`critique: ${critique.gaps.length} coverage gap(s) found — planner amending the plan`);
+      const amended = await agent(amendPrompt(tasks, critique), roleOpts('planner', {
+        schema: DECOMPOSE_SCHEMA, phase: 'Decompose', label: 'decompose:amend',
+      }));
+      if ((amended?.tasks || []).length) { plan = amended; tasks = amended.tasks; }
+    } else {
+      log('critique: no coverage gaps found');
+    }
+  }
+
   phase('Record');
-  const rec = await agent(decomposeRecorderPrompt(tasks), {
-    agentType: AT.scribe, model: M.scribe, schema: RECORD_SCHEMA, phase: 'Record', label: 'record:tasks.json',
-  });
+  const rec = await agent(decomposeRecorderPrompt(tasks), roleOpts('scribe', {
+    schema: RECORD_SCHEMA, phase: 'Record', label: 'record:tasks.json',
+  }));
   log(`decompose complete: ${tasks.length} task(s) written to ${STATE_DIR}/tasks.json (recorded=${rec?.written === true})`);
   return {
     phase: 'plan',
@@ -610,9 +755,9 @@ if (PHASE === 'plan') {
 // PHASE: run — execute the per-task plan→develop→review→triage loop
 // =============================================================================
 phase('Load');
-const loaded = await agent(loaderPrompt(), {
-  agentType: AT.scribe, model: M.scribe, schema: LOADER_SCHEMA, phase: 'Load', label: 'load-plan',
-});
+const loaded = await agent(loaderPrompt(), roleOpts('scribe', {
+  schema: LOADER_SCHEMA, phase: 'Load', label: 'load-plan',
+}));
 if (loaded?.plan_missing || !(loaded?.tasks || []).length) {
   throw new Error(`No approved task plan at ${STATE_DIR}/tasks.json — run phase:"plan" first, then approve it.`);
 }
@@ -633,9 +778,9 @@ log(`resume: ${allTasks.length - notDone.length}/${allTasks.length} done; ${pend
 // One-time baseline prep: fold any pre-existing modified TRACKED files into the staged baseline so
 // each task's UNSTAGED diff is purely that task's work (keeps the reviewer's git-diff scope clean).
 if (A.prepBaseline !== false && pending.length) {
-  const base = await agent(baselinePrompt(), {
-    agentType: AT.scribe, model: M.scribe, schema: BASELINE_SCHEMA, phase: 'Load', label: 'baseline-prep',
-  });
+  const base = await agent(baselinePrompt(), roleOpts('scribe', {
+    schema: BASELINE_SCHEMA, phase: 'Load', label: 'baseline-prep',
+  }));
   log(`baseline: staged ${(base?.staged_files || []).length} pre-existing file(s); ignoring ${(base?.ignored_untracked || []).length} untracked`);
 }
 
@@ -645,15 +790,22 @@ let blockerReason = '';
 
 for (const task of pending) {
   if (halted) break;
+  // Budget guard: when the user set a token target (e.g. "+500k"), stop CLEANLY between tasks
+  // rather than letting an agent() call throw mid-task. Completed work is recorded; resume re-runs
+  // the same args and skips done tasks.
+  if (budget.total && budget.remaining() < (A.minTaskBudget ?? 150_000)) {
+    log(`⏸ stopping before ${task.id}: ~${Math.round(budget.remaining() / 1000)}k tokens remain (< minTaskBudget) — resume with the same args to continue`);
+    break;
+  }
   // Guard: a dependency is "satisfied" once it reached a done* status (gate met). A dependency that
   // ended gate-UNMET (functionally broken) is a TRUE blocker — we can't safely build on it.
   const unmetDep = (task.depends_on || []).find((d) => !isDone(d));
   if (unmetDep) {
     halted = true;
     blockerReason = `Task ${task.id} cannot proceed: dependency ${unmetDep} did not reach a gate-met (done) state.`;
-    await agent(`You are the SCRIBE. Append a clear entry to ${STATE_DIR}/BLOCKERS.md (create it with a "# Blockers" header if missing) recording that the run halted because: ${blockerReason}. Include what the user should check/fix and that the run can resume after. Do NOT modify source code. Return written=true.`, {
-      agentType: AT.scribe, model: M.scribe, schema: RECORD_SCHEMA, phase: 'Triage', label: 'blocker:dependency',
-    });
+    await agent(`You are the SCRIBE. Append a clear entry to ${STATE_DIR}/BLOCKERS.md (create it with a "# Blockers" header if missing) recording that the run halted because: ${blockerReason}. Include what the user should check/fix and that the run can resume after. Do NOT modify source code. Return written=true.`, roleOpts('scribe', {
+      schema: RECORD_SCHEMA, phase: 'Triage', label: 'blocker:dependency',
+    }));
     log(`✋ BLOCKER: ${blockerReason}`);
     break;
   }
@@ -668,18 +820,16 @@ for (const task of pending) {
   let research = [];
   let plan = null;
   for (let i = 0; i <= MAX_RESEARCH; i++) {
-    plan = await agent(planPrompt(task, research), {
-      agentType: AT.planner, model: M.planner, schema: PLAN_SCHEMA,
-      phase: 'Plan', label: i === 0 ? `plan:${task.id}` : `plan:${task.id} r${i}`,
-    });
+    plan = await agent(planPrompt(task, research), roleOpts('planner', {
+      schema: PLAN_SCHEMA, phase: 'Plan', label: i === 0 ? `plan:${task.id}` : `plan:${task.id} r${i}`,
+    }));
     const qs = (plan?.research_requests || []).filter(Boolean);
     if (!qs.length || i === MAX_RESEARCH) break;
     log(`  plan: ${qs.length} research question(s) before develop`);
     phase('Research');
-    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), {
-      agentType: AT.research, model: M.research, schema: RESEARCH_SCHEMA,
-      phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
-    })));
+    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), roleOpts('research', {
+      schema: RESEARCH_SCHEMA, phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
+    }))));
     research = research.concat(answers.filter(Boolean));
   }
   if (!plan) { record.status = 'skipped (no plan)'; ledger.push(record); continue; }
@@ -693,10 +843,9 @@ for (const task of pending) {
     record.rounds = round;
 
     phase('Develop');
-    const dev = await agent(developPrompt(task, devPlan, repair), {
-      agentType: AT.develop, model: M.develop, schema: DEVELOP_SCHEMA,
-      phase: 'Develop', label: `develop:${task.id} r${round}`,
-    });
+    const dev = await agent(developPrompt(task, devPlan, repair), roleOpts('develop', {
+      schema: DEVELOP_SCHEMA, phase: 'Develop', label: `develop:${task.id} r${round}`,
+    }));
     const gx = devPlan.gate_expectation || task.gate_expectation || 'green';
     const needTests = (devPlan.tests_required ?? task.tests_required) === true;
     const gateMet = gateOk(gx, needTests, dev);
@@ -704,12 +853,18 @@ for (const task of pending) {
     if (dev?.tests_written) record.tests_added++;
     record.gates = { expectation: gx, met: gateMet, build: dev?.build_passed ?? null, test_outcome: dev?.test_outcome ?? null };
 
-    // Review the unstaged diff (skip only if gates are red AND nothing was produced).
-    phase('Review');
-    const review = await agent(reviewPrompt(task, handled), {
-      agentType: AT.review, model: M.review, schema: REVIEW_SCHEMA,
-      phase: 'Review', label: `review:${task.id} r${round}`,
-    });
+    // Review the unstaged diff — skipped when the developer produced no changes (an empty diff
+    // has nothing to review; the gate outcome alone drives the next round).
+    const produced = (dev?.results || []).some((r) => r.status === 'CHANGED' || r.status === 'ADDED');
+    let review = null;
+    if (produced) {
+      phase('Review');
+      review = await agent(reviewPrompt(task, handled), roleOpts('review', {
+        schema: REVIEW_SCHEMA, phase: 'Review', label: `review:${task.id} r${round}`,
+      }));
+    } else {
+      log(`  review skipped r${round}: developer reported no changed/added files`);
+    }
     const findings = (review?.findings || [])
       .filter((f) => (SEV_RANK[f.severity] ?? 1) >= REVIEW_SEV)
       .map((f, i) => ({ id: `${slug(task.id)}-r${round}-${i}`, f }))
@@ -717,10 +872,16 @@ for (const task of pending) {
 
     phase('Triage');
     const isLastRound = round >= MAX_ROUNDS;
-    const triage = await agent(triagePrompt(task, findings, round, gateMet, gateDesc, dev?.gate_output || '', isLastRound), {
-      agentType: AT.planner, model: M.planner, schema: TRIAGE_SCHEMA,
-      phase: 'Triage', label: `triage:${task.id} r${round}`,
-    });
+    // Happy path (clean review + gate met): a LEAN accept — regression spot-check + stage — on the
+    // cheaper review tier. Findings or a missed gate get the full planner triage.
+    const lean = findings.length === 0 && gateMet && produced;
+    const triage = lean
+      ? await agent(acceptPrompt(task, round, gateDesc), roleOpts('review', {
+          schema: TRIAGE_SCHEMA, phase: 'Triage', label: `accept:${task.id} r${round}`,
+        }))
+      : await agent(triagePrompt(task, findings, round, gateMet, gateDesc, dev?.gate_output || '', isLastRound), roleOpts('planner', {
+          schema: TRIAGE_SCHEMA, phase: 'Triage', label: `triage:${task.id} r${round}`,
+        }));
     if (triage?.regression_found) record.regression = true;
 
     // Tally + remember terminal routings so the reviewer won't resurface them.
@@ -773,12 +934,29 @@ for (const task of pending) {
 
   // ---- RECORD (durable per-task; survives kill/resume) ----------------------
   phase('Record');
-  const rec = await agent(recorderPrompt(task, record, allTasks.length), {
-    agentType: AT.scribe, model: M.scribe, schema: RECORD_SCHEMA, phase: 'Record', label: `record:${task.id}`,
-  });
+  const rec = await agent(recorderPrompt(task, record, allTasks.length), roleOpts('scribe', {
+    schema: RECORD_SCHEMA, phase: 'Record', label: `record:${task.id}`,
+  }));
   record.recorded = rec?.written === true;
   doneById.set(task.id, record.status.startsWith('done') ? 'done' : record.status);
   ledger.push(record);
+}
+
+// =============================================================================
+// Final completeness sweep — only when EVERY task is done. An independent agent re-derives the
+// change surface from the GOAL (grep, full gates, staged-diff spot-check) and reports anything the
+// task plan missed to SWEEP.md. This is the "did we actually finish?" check the per-task loop —
+// which deliberately never looks beyond its own diff — cannot do. Disable with finalSweep:false.
+// =============================================================================
+let sweep = null;
+if (A.finalSweep !== false && !halted && ledger.length && allTasks.every((t) => isDone(t.id))) {
+  phase('Sweep');
+  sweep = await agent(sweepPrompt(allTasks.map((t) => t.id)), roleOpts('review', {
+    schema: SWEEP_SCHEMA, phase: 'Sweep', label: 'final-sweep',
+  }));
+  log(sweep?.complete
+    ? `sweep: no goal-coverage gaps found (suite: ${sweep?.suite_result || 'n/a'})`
+    : `sweep: ${(sweep?.gaps || []).length} potential gap(s) — see ${STATE_DIR}/SWEEP.md`);
 }
 
 // =============================================================================
@@ -790,6 +968,7 @@ return {
   halted,
   blockerReason: halted ? blockerReason : '',
   stateDir: STATE_DIR,
+  sweep: sweep ? { complete: sweep.complete === true, gaps: (sweep.gaps || []).length, suite: sweep.suite_result || '' } : null,
   summary: {
     tasksProcessed: ledger.length,
     done: ledger.filter((r) => r.status.startsWith('done')).length,
@@ -804,5 +983,5 @@ return {
   ledger,
   followups: halted
     ? `Run halted — see ${STATE_DIR}/BLOCKERS.md. Resolve, then resume with resumeFromRunId.`
-    : `Review ${STATE_DIR}/LEDGER.md, ${STATE_DIR}/NEEDS-DECISION.md, and the staged diff in ${REPO}.`,
+    : `Review ${STATE_DIR}/LEDGER.md, ${STATE_DIR}/NEEDS-DECISION.md${sweep && sweep.complete !== true ? `, ${STATE_DIR}/SWEEP.md (coverage gaps!)` : ''}, and the staged diff in ${REPO}.`,
 };

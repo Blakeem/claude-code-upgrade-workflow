@@ -16,7 +16,11 @@ framework.
 
 ## What it actually does
 
-For every task in the plan, it runs a tight loop:
+Planning is two-pass: a planner decomposes the goal into tasks, then an **independent critic**
+re-derives the change surface from the repo itself (grep, not memory) and the plan is amended to
+cover anything missed — all before you approve it.
+
+Then, for every task in the plan, it runs a tight loop:
 
 1. **Plan** — a senior-engineer agent reads your code (and a reference example, if you provide one)
    and writes a precise, minimal implementation plan. It can pull in ad-hoc research first.
@@ -31,6 +35,11 @@ It works **test-first**: for risky features it writes the failing tests first, t
 code until they pass. It leaves the code it touches a little better, fixes obvious wins and
 testing blockers, and **flags** (rather than silently changing) anything that's a real
 business-logic judgment call.
+
+When **every** task is done, a **final completeness sweep** independently re-checks the whole goal:
+it greps for leftover instances of what was supposed to change, runs your full build + test gates,
+and writes any gaps to `SWEEP.md` — so "all tasks green" can't quietly mean "we missed a call site
+the plan never knew about."
 
 ### Safety model — why it won't cause regressions
 
@@ -109,6 +118,8 @@ Then check the run's reports under `runs/<runId>/`:
 - **`LEDGER.md`** — every task and its status.
 - **`NEEDS-DECISION.md`** — anything the workflow flagged for *you* (usually a business-logic call).
   Read this before committing.
+- **`SWEEP.md`** — the final completeness sweep's verdict: full-suite result plus any goal-coverage
+  gaps it found (with file:line evidence). Written only when every task finished.
 - **`CHANGELOG.md`** — a human-readable summary of what changed.
 - **`BLOCKERS.md`** — only present if a run hard-stopped; explains why and how to resume.
 
@@ -151,4 +162,8 @@ anything too large. Use `runOnly` to checkpoint cheaply.
 | `baselineNote` |  | expected pre-existing working-tree changes to fold into the baseline |
 | `fixSeverity` / `reviewSeverity` |  | severity floors (default `high`) |
 | `maxRounds` / `maxResearch` |  | per-task fix-round / research caps (default 3 / 3) |
-| `models` / `agentTypes` |  | per-role model tier and subagent type |
+| `planCritic` |  | independent coverage critique of the plan before approval (default `true`) |
+| `finalSweep` |  | post-run completeness sweep once all tasks are done (default `true`) |
+| `minTaskBudget` |  | with a token target set, stop cleanly between tasks below this remainder (default `150000`) |
+| `models` |  | per-role model tier (defaults: planner/develop `opus`, research/review/scribe `sonnet`) |
+| `agentTypes` |  | per-role custom subagent types — **only set ones that exist in your agent registry**; by default roles use the standard workflow subagent (research uses the built-in `Explore`) |
