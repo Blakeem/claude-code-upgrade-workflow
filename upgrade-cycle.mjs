@@ -1,288 +1,195 @@
 export const meta = {
   name: 'upgrade-cycle',
-  description: 'Goal-driven autonomous upgrade/migration: decompose → plan → develop → review → triage, looped per task until done, blocked, or flagged',
-  whenToUse: 'Drive a detailed prose goal (migrate a data model, upgrade a language/runtime version, port a framework, refactor a subsystem) to a production-ready state over a long autonomous run. Two-phase: phase:"plan" decomposes + stops for approval; phase:"run" executes.',
+  description: 'Section-driven migration/upgrade/refactor: drive ONE prose goal — broken into ordered, dependency-sequenced SECTIONS in plan mode — to a production-ready, gate-green state across one target git repo. Per section: develop → BLIND pure-code review (must pass) → plan-aware section-acceptance + regression review (stages on pass), looped per round; the accepted baseline advances section by section. A whole-goal sweep brackets the run. Agents exchange messages as verbatim files; the harness only routes the section id, round, and verdicts.',
+  whenToUse: 'A BREADTH-SPANNING goal across many call sites — migrate a data model, upgrade a language/runtime version, port a framework, refactor a subsystem — that is too big for one bounded feature (use the sibling feature-cycle for that) but is ONE coherent goal. The orchestrating agent decomposes the goal into ORDERED SECTIONS in PLAN MODE (EnterPlanMode → ~/.claude/plans/<name>.md, one "## Section: <id>" per bounded change), the user approves (ExitPlanMode), then runs MANDATORY phase:"refine" (whole-plan adversarial coverage review vs the real repo) — folds in the gaps, ensures a CLEAN unstaged working tree — then phase:"run" (executes the sections in order, staging each on accept). Reuse the same runId + planPath throughout.',
   phases: [
-    { title: 'Load', detail: 'Read the approved task plan + prior progress (resume)' },
-    { title: 'Decompose', detail: 'Planner breaks the goal into an ordered, dependency-aware task list (plan phase only)' },
-    { title: 'Research', detail: 'Ad-hoc read-only agent answers the Planner\'s open questions before it commits to a plan' },
-    { title: 'Critique', detail: 'Independent critic re-derives the change surface and flags plan coverage gaps (plan phase only)' },
-    { title: 'Plan', detail: 'Planner emits a verified, minimal develop-plan for one task; sets tests_required' },
-    { title: 'Develop', detail: 'Developer implements minimally + tests, runs gates, leaves changes UNSTAGED' },
-    { title: 'Review', detail: 'Adversarial reviewer reads the unstaged git diff only (this cycle\'s scope)' },
-    { title: 'Triage', detail: 'Planner routes findings via the decision matrix, stages on accept, hard-stops on a blocker' },
-    { title: 'Record', detail: 'Scribe persists per-task progress + CHANGELOG + rebuilds LEDGER' },
-    { title: 'Sweep', detail: 'After ALL tasks are done: independent agent hunts for goal-coverage gaps the plan missed' },
+    { title: 'Refine', detail: 'MANDATORY first pass (refine phase only): an independent critic greps the WHOLE change surface, verifies every section of the plan against real code, returns coverage gaps + blocking questions + too_big to the orchestrating agent. Writes nothing.' },
+    { title: 'Develop', detail: 'Developer reads the approved plan (verbatim) + its section + the latest review that flagged issues; implements ONLY that section minimally, runs the gate, leaves changes UNSTAGED. Owns the decision matrix; halts only for a user-only decision.' },
+    { title: 'Quality', detail: 'BLIND pure-code critic: reads ONLY the unstaged diff (no plan, no goal), flags production-blocking defects, writes quality-review-<section>-N.md. Must be clean to proceed.' },
+    { title: 'Acceptance', detail: 'Plan-aware section gate: every acceptance criterion of THIS section met + reachable + section gate green + no regression vs the staged baseline. Writes acceptance-review-<section>-N.md; on pass, STAGES the section (git add, never commit) — the baseline advances.' },
+    { title: 'Sweep', detail: 'After the FINAL section is staged: an independent agent re-greps the whole surface, runs the full gates, spot-checks the staged diff, writes SWEEP.md. The only whole-goal completeness check.' },
   ],
 };
 
 // =============================================================================
-// Config — everything app/goal-specific arrives via args so the script stays general
+// Config — everything app/goal-specific arrives via args so the engine stays general.
+// The PLAN is produced OUTSIDE this engine, in PLAN MODE, and read VERBATIM from its file by the
+// developer + section-acceptance verifier (never parsed-and-rebuilt — see WORKFLOW-PRINCIPLES.md #2).
+// The blind quality reviewer is never given the plan path (#3). The ONLY thing that travels as control
+// is the ordered `sections` list of thin {id,title,gate} knobs (routing, not content — #1/#8) plus the
+// round number. The main agent ensures a clean unstaged working tree before phase:"run" (#4) — there is
+// no baseline/loader/scribe/decompose agent; decomposition + approval happen in plan mode.
 // =============================================================================
 const A = typeof args === 'string' ? JSON.parse(args) : args;
-if (!A || !A.goal || !A.runId) {
-  throw new Error('args must include at least { runId, goal, target, gates }; got typeof=' + (typeof args));
+if (!A || !A.runId || !(A.planPath || (A.plan && typeof A.plan !== 'object'))) {
+  throw new Error('args must include at least { runId, planPath | plan (markdown string), sections, target, gates }; got typeof=' + (typeof args));
+}
+// `root` is REQUIRED setup the main agent supplies (#4 — no in-engine "find my cwd" agent). It is the
+// absolute path the run-state dir hangs off, normally the workflow tool's own directory.
+if (!A.root) {
+  throw new Error('args.root is required: pass the ABSOLUTE path the run-state should hang off (normally this workflow tool\'s own directory). The engine no longer spawns an agent to auto-detect it.');
 }
 
-const PHASE      = A.phase ?? 'plan';                       // 'plan' (decompose+stop) | 'run' (execute)
-const RUN_ID     = A.runId;
-const GOAL       = A.goal;
-const TARGET     = A.target ?? {};                          // { repo, lang, framework }
-const REFERENCE  = A.reference ?? '';                       // optional: a completed example to diff against
-const CONVENTIONS= A.conventions ?? '(none supplied — infer from the surrounding code)';
-const GATES      = A.gates ?? {};                           // { build, test, testSetup }
-const SEED       = A.seed ?? [];                            // optional task seed to anchor decomposition
-const MAX_ROUNDS = A.maxRounds ?? 3;                        // fix rounds per task before "needs-attention"
-const MAX_RESEARCH = A.maxResearch ?? 3;                    // research↔re-plan iterations before forcing a plan
+const PHASE       = A.phase ?? 'run';                       // 'refine' (review the plan, stop) | 'run' (execute sections)
+const RUN_ID      = A.runId;
+const TARGET      = A.target ?? {};                         // { repo, lang, framework }
+const REFERENCE   = A.reference ?? '';                      // optional: a completed example to mirror
+const CONVENTIONS = A.conventions ?? '(none supplied — infer from the surrounding code)';
+const GATES       = A.gates ?? {};                          // { build, test, testSetup }
+const MAX_ROUNDS  = A.maxRounds ?? 4;                       // develop→quality→acceptance rounds per section before "needs-attention"
 
-// Per-role model tiers + OPTIONAL custom subagent types. By default no agentType is passed, so
-// every role runs as the harness's standard workflow subagent (always available); 'Explore' for
-// research is a Claude Code built-in. Only set an agentType that exists in YOUR agent registry.
-// Scribe work is mechanical (verbatim JSON writes, status tables) — a cheaper tier is deliberate.
-const AT = { research: 'Explore', ...(A.agentTypes ?? {}) };
-const M  = { planner: 'opus', research: 'sonnet', develop: 'opus', review: 'sonnet', scribe: 'sonnet', ...(A.models ?? {}) };
+// Per-role model tiers + OPTIONAL custom subagent types. By default no agentType is passed, so every
+// role runs as the harness's standard workflow subagent (always available). Only set an agentType that
+// exists in YOUR registry. Acceptance is opus (spec + regression, high stakes); the blind quality
+// critic is the fast tier (runs every round). The refine/sweep critics reuse the quality tier.
+const M  = { develop: 'opus', quality: 'sonnet', acceptance: 'opus', refine: 'opus', sweep: 'sonnet', ...(A.models ?? {}) };
+const AT = { ...(A.agentTypes ?? {}) };
 const roleOpts = (role, extra) => ({ model: M[role], ...(AT[role] ? { agentType: AT[role] } : {}), ...extra });
 
-// Resolve ROOT to an ABSOLUTE path so every agent + `git -C` call is cwd-independent (subagents
-// run with varying working directories, so relative paths would scatter state). Priority:
-//   1. explicit args.root  →  2. AUTO-DETECT the working directory at runtime.
-// (2) makes the tool adapt to wherever it is invoked from with no hardcoded per-machine path.
-// Run-state lands in `<ROOT>/runs/<runId>` unless args.stateDir overrides it.
-let ROOT = (A.root ? String(A.root) : '').replace(/\\/g, '/').replace(/\/+$/, '');
-if (!ROOT) {
-  const loc = await agent(
-    'Output ONLY the absolute current working directory: run `pwd` and return its path verbatim, nothing else. Read-only — change nothing.',
-    roleOpts('research', { label: 'locate-root',
-      schema: { type: 'object', required: ['cwd'], properties: { cwd: { type: 'string' } } } }),
-  );
-  ROOT = String(loc?.cwd ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
-  log(`root auto-detected: ${ROOT || '(detection failed — falling back to cwd-relative paths)'}`);
-}
-const abs        = (p) => (ROOT && !/^([a-zA-Z]:)?\//.test(p)) ? `${ROOT}/${p}` : p;
+// ROOT is the ABSOLUTE base that run-state hangs off (supplied by the main agent — see the required
+// check above), so every agent + `git -C` call is cwd-independent. Run-state lands in
+// `<ROOT>/runs/<runId>` unless args.stateDir overrides it.
+const ROOT        = String(A.root).replace(/\\/g, '/').replace(/\/+$/, '');
+const norm        = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '');
+const abs         = (p) => { const n = norm(p); return (ROOT && !/^([a-zA-Z]:)?\//.test(n)) ? `${ROOT}/${n}` : n; };
+const slug        = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
 const REFERENCE_P = REFERENCE ? abs(REFERENCE) : '';
-const REPO       = abs(TARGET.repo ?? '.');                 // absolute path to the target git repo
-const STATE_DIR  = abs(A.stateDir ?? `runs/${RUN_ID}`);     // <root>/runs/<runId> unless overridden
+const REPO        = abs(TARGET.repo ?? '.');               // absolute path to the target git repo
+const STATE_DIR   = abs(A.stateDir ?? `runs/${RUN_ID}`);   // <root>/runs/<runId> unless overridden
+const PLAN_PATH   = A.planPath ? abs(A.planPath) : '';
+const PLAN_INLINE = (!A.planPath && A.plan && typeof A.plan !== 'object') ? String(A.plan) : '';
+// The plan reference handed to plan-aware agents (developer, acceptance, refine, sweep). NEVER handed
+// to the blind quality reviewer.
+const PLAN_REF    = PLAN_PATH ? `the approved plan file at ${PLAN_PATH} (read it VERBATIM)` : `the approved plan below:\n-----\n${PLAN_INLINE}\n-----`;
+// How an agent locates its one section inside the verbatim plan — by header, no parsing.
+const sectionRef  = (id) => PLAN_PATH
+  ? `the section headed "## Section: ${id}" inside ${PLAN_PATH} (read THAT section verbatim — the other sections are CONTEXT only; do NOT implement them)`
+  : `the section headed "## Section: ${id}" in the plan above (the other sections are CONTEXT only; do NOT implement them)`;
 
-// Two severity floors. Review surfaces everything >= REVIEW_SEV; everything >= FIX_SEV is
-// fixable IN-LOOP — UNLESS it's a pre-existing business-logic defect (regression risk), which
-// is flagged to NEEDS-DECISION instead.
-const SEV_RANK   = { low: 1, medium: 2, high: 3, critical: 4 };
-// LEAN policy (deliberate, to save context): this workflow makes the REQUESTED change correct and
-// production-safe — it is NOT a general code review. The reviewer looks only at the diff and
-// surfaces only INTRODUCED, production-blocking (high+) defects + testing blockers. Easy obvious
-// in-scope wins are taken; medium/low/cosmetic issues are neither fixed nor logged — a separate
-// code-review workflow catches those. So the review floor defaults HIGH.
-const FIX_SEV    = SEV_RANK[A.fixSeverity ?? 'high'];
-const REVIEW_SEV = SEV_RANK[A.reviewSeverity ?? (A.fixSeverity ?? 'high')];
+// =============================================================================
+// Sections — the ordered, dependency-sequenced control list the main agent supplies. Each entry is a
+// THIN control object {id, title, gate} (routing knobs, NOT content — the section body lives in the
+// plan file, read verbatim). Execution is array order = dependency order. runOnly / startAt scope a
+// cheaper partial slice (e.g. the harness + first section) without editing the plan.
+// =============================================================================
+const VALID_GATES = new Set(['green', 'red-baseline', 'build-only']);
+const ALL_SECTIONS = (Array.isArray(A.sections) ? A.sections : [])
+  .map((s) => (typeof s === 'string' ? { id: s } : s))
+  .filter((s) => s && s.id)
+  .map((s) => ({ id: String(s.id), title: s.title || s.id, gate: VALID_GATES.has(s.gate) ? s.gate : 'green' }));
 
-const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+const qualityFile    = (id, r) => `${STATE_DIR}/quality-review-${slug(id)}-r${r}.md`;
+const acceptanceFile = (id, r) => `${STATE_DIR}/acceptance-review-${slug(id)}-r${r}.md`;
+const NEEDS_USER     = `${STATE_DIR}/NEEDS-USER.md`;            // full detail; for the user (may halt the run) — GLOBAL/cumulative
+const dismissedFile  = (id) => `${STATE_DIR}/DISMISSED-${slug(id)}.md`;  // terse ledger; developer → reviewers (anti-spin) — PER SECTION
+const SWEEP_FILE     = `${STATE_DIR}/SWEEP.md`;                 // final whole-goal completeness sweep
 
-// Per-task gate semantics. Some goals keep the WHOLE suite intentionally red mid-run (test-first
+// The settled-decisions both reviewers read so they don't re-raise closed findings (but NOT prior
+// review files — that would anchor them; see WORKFLOW-PRINCIPLES.md #5). Scoped per section.
+// canContest=true gives the BLIND quality reviewer the contest channel (its schema reports
+// contested_dismissals). The acceptance verifier passes false — it does not contest via this token; it
+// has the stronger plan-aware OVERRIDE channel below (a dismissed item that breaks a criterion fails
+// acceptance regardless), and its schema carries no contest field.
+const SETTLED = (id, canContest = true) => `Before reviewing, READ these if they exist — they are the settled decisions, so you do
+NOT re-raise what is already closed:
+  • ${dismissedFile(id)} — findings the developer declined for THIS section, each with a one-line reason.
+  • ${NEEDS_USER} — items already escalated to the user.
+Skip anything listed there FOR THE STATED REASON. Do NOT read prior review files — review the CURRENT
+diff FRESH (so you also catch new or similar nearby issues, and independently re-verify earlier fixes).${canContest ? `
+If you are confident a DISMISSED reason is WRONG and the issue is genuinely production-blocking, raise
+it ONCE, prefixed "CONTESTS DISMISSAL:", explaining why the reason does not hold.` : ''}`;
+
+// Per-section gate semantics. Some goals keep the WHOLE suite intentionally RED mid-run (test-first
 // migrations where the environment/schema already moved ahead of the code), so "done" is judged
-// per-task against its own selector, never whole-suite-green:
-//   green        -> build passes AND this task's (selector-scoped) tests pass
+// per-section against its OWN selector, never whole-suite-green:
+//   green        -> build passes AND this section's (selector-scoped) tests RAN and PASSED
 //   red-baseline -> build passes AND the authored tests FAIL for the expected reason (TDD red step)
-//   build-only   -> build passes; no test pass/fail requirement
-// Build (lint/compile) must ALWAYS pass — a broken build is never acceptable.
-function gateOk(gx, needTests, dev) {
+//   build-only   -> build passes; no test pass/fail requirement (mechanical/testless sections)
+// Build (lint/compile) must ALWAYS pass — a broken build is never acceptable. Whole-suite regression
+// is the ACCEPTANCE reviewer's job (it compares against the staged baseline), not this scoped gate.
+function gateOk(gate, dev) {
   if (!dev) return false;
   if (GATES.build && dev.build_passed !== true) return false;       // build/lint must always pass
-  if (!GATES.test || gx === 'build-only') return true;
-  if (gx === 'red-baseline') return dev.test_outcome === 'failed-expected';
-  if (needTests && dev.tests_run_count === 0) return false;         // selector matched NOTHING — a false green
-  return needTests ? dev.test_outcome === 'passed' : true;          // 'green' (no-test tasks pass on build)
+  if (gate === 'build-only') return true;
+  if (gate === 'red-baseline') return dev.test_outcome === 'failed-expected';
+  // green:
+  if (dev.test_outcome === 'not-run') return false;                  // green requires the selector tests to have run
+  if (dev.tests_run_count === 0) return false;                       // selector matched NOTHING = a FALSE green
+  return dev.test_outcome === 'passed';
 }
 
 // =============================================================================
-// Structured-output schemas
+// Structured-output schemas — DECISIONS ONLY (control plane). All prose/content lives in files.
 // =============================================================================
-const TASK_SHAPE = {
-  type: 'object',
-  required: ['id', 'title', 'description', 'files', 'tests_required'],
-  properties: {
-    id: { type: 'string', description: 'stable kebab-case id, unique within the plan' },
-    title: { type: 'string' },
-    description: { type: 'string', description: 'what this task changes and why, grounded in the goal' },
-    files: { type: 'array', items: { type: 'string' }, description: 'likely-touched source paths (repo-relative)' },
-    depends_on: { type: 'array', items: { type: 'string' }, description: 'task ids that must complete first' },
-    tests_required: { type: 'boolean', description: 'true if break-risk × business-logic-importance × complexity warrants tests' },
-    tests_rationale: { type: 'string' },
-    acceptance: { type: 'string', description: 'observable definition of done for this task' },
-    risk: { type: 'string', enum: ['low', 'medium', 'high'] },
-    gate_expectation: {
-      type: 'string', enum: ['green', 'red-baseline', 'build-only'],
-      description: 'what gate outcome means DONE for this task. green = build + THIS task\'s tests pass. red-baseline = author tests that FAIL for the expected reason (test-first/TDD); build green, suite intentionally red. build-only = no test pass/fail requirement.',
-    },
-    test_selector: { type: 'string', description: 'which tests define this task done — a test path or name filter scoped to this task (e.g. a single test file, or a --filter/-k pattern); "" = none / whole suite' },
-    size: { type: 'string', enum: ['S', 'M', 'L'], description: 'rough effort/context for ONE develop pass. Target M (~1–6 files, fits ~150k tokens). Fold S into a neighbor; split L.' },
-  },
-};
-
-const DECOMPOSE_SCHEMA = {
-  type: 'object',
-  required: ['tasks', 'research_requests'],
-  properties: {
-    tasks: { type: 'array', items: TASK_SHAPE },
-    research_requests: { type: 'array', items: { type: 'string' }, description: 'open questions to resolve before the plan is trustworthy; empty when confident' },
-    notes: { type: 'string' },
-  },
-};
-
-const RESEARCH_SCHEMA = {
-  type: 'object',
-  required: ['question', 'findings'],
-  properties: {
-    question: { type: 'string' },
-    findings: { type: 'string', description: 'concrete answer with file paths / commit refs / code excerpts' },
-    recommendation: { type: 'string' },
-  },
-};
-
-const PLAN_SCHEMA = {
-  type: 'object',
-  required: ['task_id', 'steps', 'files', 'tests_required', 'research_requests'],
-  properties: {
-    task_id: { type: 'string' },
-    steps: { type: 'array', items: { type: 'string' }, description: 'ordered, minimal implementation steps' },
-    files: { type: 'array', items: { type: 'string' } },
-    tests_required: { type: 'boolean' },
-    tests_plan: { type: 'string', description: 'what to test and how (unit or integration), or "" if none' },
-    gate_expectation: { type: 'string', enum: ['green', 'red-baseline', 'build-only'], description: 'confirm/override the task gate expectation' },
-    test_selector: { type: 'string', description: 'confirm/override the test path/filter scoping this task done' },
-    research_requests: { type: 'array', items: { type: 'string' }, description: 'remaining open questions; empty = ready to develop' },
-    decision_notes: { type: 'string', description: 'where the decision matrix chose between valid options' },
-  },
-};
-
 const DEVELOP_SCHEMA = {
   type: 'object',
-  required: ['results', 'build_passed', 'test_outcome', 'unstaged_confirmed'],
+  required: ['produced', 'build_passed', 'test_outcome', 'unstaged_confirmed', 'needs_user'],
   properties: {
-    results: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['file', 'status', 'summary'],
-        properties: {
-          file: { type: 'string' },
-          status: { type: 'string', enum: ['CHANGED', 'ADDED', 'SKIPPED', 'FAILED'] },
-          summary: { type: 'string' },
-        },
-      },
-    },
-    tests_written: { type: 'boolean' },
-    build_passed: { type: 'boolean' },
-    test_passed: { type: 'boolean', description: 'true if the task tests ran AND passed' },
-    test_outcome: {
-      type: 'string', enum: ['passed', 'failed-expected', 'failed-unexpected', 'not-run'],
-      description: 'passed = task tests green. failed-expected = red baseline exactly as the test-first task intends. failed-unexpected = failed for a wrong reason (a real defect). not-run = no tests executed.',
-    },
-    ran_tests: { type: 'boolean' },
-    tests_run_count: { type: 'integer', description: 'how many tests the runner ACTUALLY executed for this task\'s selector. 0 = the selector matched nothing (a false green — the gate fails on it); -1 = the runner reports no count' },
-    unstaged_confirmed: { type: 'boolean', description: 'true if changes were left UNSTAGED (git add NOT run)' },
-    gate_output: { type: 'string', description: 'tail of failing gate output, or "" if green' },
-    notes: { type: 'string' },
+    produced:          { type: 'boolean', description: 'true if you changed or added at least one file this round' },
+    build_passed:      { type: 'boolean' },
+    test_outcome:      { type: 'string', enum: ['passed', 'failed-expected', 'failed-unexpected', 'not-run'], description: 'passed = this section\'s selector tests ran and PASSED. failed-expected = red baseline exactly as a test-first section intends. failed-unexpected = failed for a WRONG reason (a real defect / bad fixture). not-run = no tests executed.' },
+    tests_run_count:   { type: 'integer', description: 'unit/integration tests the runner ACTUALLY executed for this section\'s selector (0 = selector matched nothing = a FALSE green; -1 = N/A, e.g. manual/MCP verification)' },
+    verification_method:{ type: 'string', description: 'what was actually run to verify (e.g. "pytest -q tests/foo.py", "phpunit --filter Bar"); note here if a configured MCP/tool was UNAVAILABLE in this environment' },
+    unstaged_confirmed:{ type: 'boolean', description: 'true if all changes were left UNSTAGED (git add NOT run on content; git add -N only, for new files)' },
+    needs_user:        { type: 'boolean', description: 'true ONLY if a HARD blocker / user-only decision stopped you; you wrote a full entry to NEEDS-USER.md and cannot proceed' },
+    dismissed_count:   { type: 'integer', description: 'how many review findings you declined and logged to this section\'s DISMISSED file this round (0 if none)' },
+    gate_output:       { type: 'string', description: 'tail of failing gate/verification output, or "" if green' },
   },
 };
 
-const REVIEW_SCHEMA = {
+const QUALITY_SCHEMA = {
   type: 'object',
-  required: ['findings'],
+  required: ['clean', 'issue_count'],
   properties: {
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['file', 'category', 'severity', 'title', 'detail', 'introduced_by_this_change', 'business_logic'],
-        properties: {
-          file: { type: 'string' },
-          line: { type: 'string' },
-          category: { type: 'string', enum: ['correctness', 'security', 'error-handling', 'regression', 'api-contract', 'data-integrity', 'types', 'testing', 'performance', 'maintainability', 'convention'] },
-          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
-          title: { type: 'string', description: 'short, specific, stable across rounds' },
-          detail: { type: 'string' },
-          introduced_by_this_change: { type: 'boolean', description: 'true if THIS cycle\'s unstaged diff introduced it; false if it pre-exists in the staged/committed baseline' },
-          business_logic: { type: 'boolean', description: 'true if it touches existing domain/business logic whose behavior could regress' },
-          suggested_fix: { type: 'string' },
-        },
-      },
-    },
+    clean:       { type: 'boolean', description: 'true if NO production-blocking defects were found in the unstaged diff' },
+    issue_count: { type: 'integer', description: 'number of production-blocking defects written to the review file' },
+    contested_dismissals: { type: 'integer', description: 'how many DISMISSED entries you re-raised as "CONTESTS DISMISSAL:" this round because the stated reason is wrong for a genuine production-blocking defect (0 if none)' },
   },
 };
 
-const TRIAGE_SCHEMA = {
+const ACCEPTANCE_SCHEMA = {
   type: 'object',
-  required: ['verdicts', 'accepted', 'staged', 'has_blocker'],
+  required: ['pass', 'staged', 'reachable'],
   properties: {
-    verdicts: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['finding_id', 'is_real', 'decision', 'blocking', 'rationale'],
-        properties: {
-          finding_id: { type: 'string' },
-          is_real: { type: 'boolean' },
-          decision: { type: 'string', enum: ['ACTIONABLE', 'DEFER', 'NEEDS_USER', 'REJECT'] },
-          blocking: { type: 'boolean', description: 'true ONLY if this prevents all further progress on the goal' },
-          matrix: {
-            type: 'object',
-            properties: {
-              clarity: { type: 'string', enum: ['clear', 'ambiguous'] },
-              effort: { type: 'string', enum: ['small', 'large'] },
-              blast_radius: { type: 'string', enum: ['local', 'cross-cutting'] },
-              scope: { type: 'string', enum: ['in-scope', 'scope-creep'] },
-              architectural: { type: 'boolean' },
-            },
-          },
-          rationale: { type: 'string' },
-          fix_instruction: { type: 'string', description: 'precise minimal instruction (ACTIONABLE only)' },
-        },
-      },
-    },
-    accepted: { type: 'boolean', description: 'true if the round is accepted (gates green, zero ACTIONABLE) and was staged' },
-    staged: { type: 'boolean', description: 'true if you ran `git add` on the task files this round' },
-    regression_found: { type: 'boolean', description: 'true if the unstaged diff regressed previously-staged/accepted work' },
-    has_blocker: { type: 'boolean', description: 'true if any verdict.blocking is true; conductor halts the whole run' },
-    new_tasks: { type: 'array', items: TASK_SHAPE, description: 'large/cross-cutting in-scope items split into follow-up tasks' },
-    next_fix_plan: {
-      type: 'object',
-      properties: { steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } } },
-      description: 'develop-plan for the next round (present when accepted=false and not blocked)',
-    },
-    wrote_logs: { type: 'boolean' },
-    summary: { type: 'string' },
+    pass:        { type: 'boolean', description: 'true if every acceptance criterion of THIS section is met, it is reachable, the section gate is satisfied, and nothing regressed' },
+    staged:      { type: 'boolean', description: 'true if you ran `git add` on this section\'s files (only on pass; NEVER commit)' },
+    reachable:   { type: 'boolean', description: 'this section\'s change is actually wired in / reachable (every call site converted, route mounted, symbol exported)' },
+    regression:  { type: 'boolean', description: 'true if the unstaged diff regressed previously-staged/accepted behavior' },
+    gap_count:   { type: 'integer', description: 'number of unmet criteria / gaps written to the review file (0 on pass)' },
+    suite_result:{ type: 'string', description: 'observed outcome of running the section gate (and, where the goal expects it, the full gates)' },
   },
 };
 
-const LOADER_SCHEMA = {
+const REFINE_SCHEMA = {
   type: 'object',
-  required: ['tasks', 'done'],
+  required: ['verdict', 'gaps', 'questions'],
   properties: {
-    tasks: { type: 'array', items: TASK_SHAPE, description: 'the approved task plan from tasks.json (empty if the file is missing)' },
-    done: { type: 'array', items: { type: 'object', required: ['id', 'status'], properties: { id: { type: 'string' }, status: { type: 'string' } } } },
-    plan_missing: { type: 'boolean' },
-  },
-};
-
-const RECORD_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, tasks_complete: { type: 'integer' } } };
-
-const CRITIQUE_SCHEMA = {
-  type: 'object',
-  required: ['gaps'],
-  properties: {
+    verdict: { type: 'string', enum: ['ready', 'needs-changes', 'needs-answers'], description: 'ready = sound + complete coverage; needs-changes = material gaps; needs-answers = blocking questions only the user can resolve' },
     gaps: {
       type: 'array',
       items: {
         type: 'object',
         required: ['title', 'evidence'],
         properties: {
-          title: { type: 'string' },
-          evidence: { type: 'string', description: 'file:line hits / grep counts proving the miss — no evidence, no gap' },
-          suggestion: { type: 'string', description: 'fold into task <id> | new task | reorder | split' },
+          title:      { type: 'string' },
+          evidence:   { type: 'string', description: 'file:line hits / grep counts proving the gap — no evidence, no gap' },
+          suggestion: { type: 'string', description: 'how to fix the plan: fold into section <id> | new section | reorder | split' },
         },
       },
     },
-    notes: { type: 'string' },
+    questions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['question'],
+        properties: {
+          question:    { type: 'string' },
+          why_blocking:{ type: 'string', description: 'why the plan is not safe to build without an answer' },
+        },
+      },
+    },
+    too_big: { type: 'boolean', description: 'true if a single section is more than one bounded develop pass and should be split (name it in notes)' },
+    notes:   { type: 'string' },
   },
 };
 
@@ -297,9 +204,9 @@ const SWEEP_SCHEMA = {
         type: 'object',
         required: ['title', 'evidence'],
         properties: {
-          title: { type: 'string' },
-          evidence: { type: 'string', description: 'file:line hits or gate output proving the gap' },
-          suggested_task: { type: 'string', description: 'a one-line follow-up task that would close it' },
+          title:         { type: 'string' },
+          evidence:      { type: 'string', description: 'file:line hits or gate output proving the gap' },
+          suggested_section: { type: 'string', description: 'a one-line follow-up section that would close it' },
         },
       },
     },
@@ -307,681 +214,425 @@ const SWEEP_SCHEMA = {
   },
 };
 
-const BASELINE_SCHEMA = {
-  type: 'object',
-  required: ['clean'],
-  properties: {
-    clean: { type: 'boolean', description: 'true once `git diff` (unstaged tracked) is empty' },
-    staged_files: { type: 'array', items: { type: 'string' } },
-    ignored_untracked: { type: 'array', items: { type: 'string' } },
-    notes: { type: 'string' },
-  },
-};
-
 // =============================================================================
-// Shared prompt fragments
+// Shared prompt fragments + decision matrix (developer-owned)
 // =============================================================================
-const CONTEXT = `
-GOAL (the north star — everything serves this; do not exceed it):
-${GOAL}
-
+const ENV = `GOAL CONTEXT — this run drives ONE breadth-spanning goal, decomposed into ordered sections in the plan.
 TARGET REPO: ${REPO}  (lang=${TARGET.lang ?? '?'}, framework=${TARGET.framework ?? '?'})
-${REFERENCE_P ? `REFERENCE (a COMPLETED example of this kind of change — mine it for the canonical pattern): ${REFERENCE_P}` : ''}
-
-CONVENTIONS (match these; deviations are 'convention' findings):
-${CONVENTIONS}
-
-GATES (the build/test commands that define "it works"):
+${REFERENCE_P ? `REFERENCE (a COMPLETED example of this kind of change — mine it for the canonical pattern): ${REFERENCE_P}\n` : ''}CONVENTIONS (match these): ${CONVENTIONS}
+GATES (the commands that define "it works"):
   build: ${GATES.build ?? '(none)'}
-  test:  ${GATES.test ?? '(none)'}
-  ${GATES.testSetup ? `test setup note: ${GATES.testSetup}` : ''}
+  test:  ${GATES.test ?? '(none)'}${GATES.testSetup ? `\n  test setup: ${GATES.testSetup}` : ''}
+BE TOKEN-ECONOMICAL: read ONLY the files this section touches plus the SPECIFIC reference/plan section
+you need — do NOT re-read the whole tree, the whole plan body, or the entire reference. Prefer targeted
+grep over broad reads. Don't restate large files back; act on them.`;
 
-STAGING CONTRACT (the cycle boundary is git itself):
-  • staged index + HEAD  = ACCEPTED baseline (prior blessed work). Treat as known-good.
-  • unstaged working tree = THIS cycle's work — the only thing under review.
-  • Developers NEVER stage. The Planner stages (git add, NEVER commit) only on acceptance.
+const MATRIX = (id) => `DECISION MATRIX — for each ambiguity or review finding, route it yourself IN ORDER (first match wins):
+  1. Not a real problem / false positive .............. DROP — LOG it (see LOGGING).
+  2. Pre-existing in untouched code (not yours) ....... DROP silently (out of scope; never fix — regression risk).
+  3. Stops the build/tests/verification ............... FIX (always).
+  4. A real, clear, in-scope fix (local, small) ....... FIX.
+  5. Needed to satisfy THIS section / wire it in ...... FIX (an unreachable or incomplete section is not done).
+  6. Conflicts with the plan / intentional / not a real-world code path ... DROP — LOG it (see LOGGING).
+  7. A genuine DESIGN/BUSINESS choice only the USER can make, OR a blocker you cannot resolve in scope
+        .............................................. ESCALATE (see LOGGING).
+  8. Anything else (style, medium/low polish, a different section's work) ... DROP silently.
+  • A finding a reviewer RE-RAISED as "CONTESTS DISMISSAL": do NOT re-drop it — FIX it, or if it is
+    truly a user-only call, ESCALATE it. NEVER log the same dismissal twice.
 
-BE TOKEN-ECONOMICAL (target ~150k tokens for your whole turn): read ONLY the files this task
-touches plus the SPECIFIC reference section you need — do NOT re-read the whole tree or the entire
-reference. Prefer targeted grep over broad reads. Don't restate large files back; act on them.
-`;
-
-const MATRIX = `
-SCOPE DISCIPLINE (this is NOT a general code review — a SEPARATE review workflow does that later):
-Act ONLY on issues THIS change introduced. Make the requested update correct, testable, and
-production-safe, and leave the code we TOUCHED a little better — nothing more. Pre-existing problems
-in untouched code are OUT OF SCOPE: never fix them (regression risk) and don't even log them.
-
-DECISION MATRIX — route each finding IN ORDER (first match wins):
-  1. is_real == false ............................................ REJECT (drop)
-  2. introduced_by_this_change == false (pre-existing) .......... REJECT (out of scope — drop, do NOT log)
-  3. prevents tests/build from running or passing .............. ACTIONABLE (testing blockers are ALWAYS fixed)
-  4. easy & obvious in-scope fix (clear, local, ≤ a few lines) . ACTIONABLE (take the easy win, any severity)
-  5. introduced regression of previously-staged/accepted work . ACTIONABLE (you raise this yourself)
-  6. severity >= ${A.fixSeverity ?? 'high'} (production-blocking) AND a clear correct in-scope fix ... ACTIONABLE (fix our own breakage)
-  7. severity >= ${A.fixSeverity ?? 'high'} but ambiguous / a business-logic judgment / needs a human call
-        ... NEEDS_USER → ${STATE_DIR}/NEEDS-DECISION.md (FLAG — must be addressed before production).
-            blocking=true ONLY if no further GOAL progress is possible without the answer.
-  8. scope-creep / new feature outside the GOAL ................ REJECT (drop, do NOT log)
-  9. otherwise (medium/low, non-blocking, not an easy win) ..... REJECT — DO NOT log it. The separate
-        code-review workflow will catch it. Conserving context is the priority here.
-NET: fix testing blockers + easy wins + our own production-blocking breakage; FLAG only the major
-issues that need a human (usually business logic); silently drop everything else. Don't chase or
-document perfection — that is what wastes context and rounds.
-`;
+LOGGING — this (plus your code) is your ONLY output. Keep it minimal and unambiguous:
+  • DROP (1 or 6): append ONE terse line to ${dismissedFile(id)} so reviewers won't re-raise it —
+      \`<file:line> — <finding gist> — SKIPPED: <reason, ≤15 words>\`
+  • ESCALATE (7): append a FULL, self-contained entry to ${NEEDS_USER} (as much detail as the user
+    needs to decide). If you CANNOT proceed without the answer, set needs_user=true (the run HALTS).
+    If you can proceed with a defensible default, record it there too but leave needs_user=false.
+This is NOT a general code review — a SEPARATE review workflow audits the whole codebase later. Make
+THIS section correct, testable, and production-safe; leave the lines you TOUCH a little better; touch
+nothing else.`;
 
 // =============================================================================
-// Role prompts
+// Role prompts — succinct; each agent gets ONE document link (the plan) for its task.
 // =============================================================================
-const decomposePrompt = (research) => `
-You are the PLANNER in DECOMPOSE mode. Read the target repo (and the reference, if given) and
-break the GOAL into an ORDERED, dependency-aware list of bounded tasks — the smallest set of
-units that, done in order, fully achieve the goal and nothing more.
-${CONTEXT}
-${SEED.length ? `SEED (a human's first-cut task list — refine, reorder, split/merge, correct; keep what's right):\n${SEED.map((s, i) => `  ${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\n')}` : ''}
-${research.length ? `RESEARCH you previously requested (use it; do not re-ask what is answered):\n${research.map((r) => `  Q: ${r.question}\n  A: ${r.findings}\n  ⇒ ${r.recommendation || ''}`).join('\n')}` : ''}
-
-RULES:
-- Each task = one coherent, reviewable change with a clear acceptance test. Order by dependency
-  (a producer before its consumers). Set depends_on accurately.
-- Set tests_required per task by your own judgment: TRUE when break-risk × business-logic
-  importance × complexity is non-trivial (auth, data integrity, money/state mutations, external API contracts);
-  FALSE for changes an LLM zero-shots correctly (mechanical, well-patterned). Explain in
-  tests_rationale. Unit OR integration — whichever catches the risk most cheaply.
-- TEST-FIRST ORDERING + GATE EXPECTATIONS. Some goals keep the whole suite intentionally RED
-  mid-run (e.g. the environment/schema/spec has already moved ahead and the code is catching up) —
-  when the GOAL implies this, "done" is per-task, never whole-suite-green. For each KEY/RISKY
-  feature, author its tests BEFORE converting it. Set each task's gate_expectation + test_selector:
-    • A test-authoring task → gate_expectation="red-baseline" (build green; the new tests must FAIL
-      for the right reason — they ARE the spec the later conversion satisfies).
-    • A conversion task → gate_expectation="green", test_selector scoping to JUST that feature's
-      tests (so the rest of the still-red suite doesn't block it).
-    • Mechanical low-risk tasks with no tests → gate_expectation="build-only".
-  If the test harness doesn't exist yet, the FIRST task stands it up (gate_expectation="green",
-  a trivial sanity test passing proves the harness works) before any red-baseline task.
-- RIGHT-SIZE TASKS for token efficiency. Each task pays a FULL plan→develop→review→triage→record
-  cycle (~hundreds of k tokens), so TINY tasks waste tokens and HUGE tasks blow an agent's context.
-  Target each task at ONE coherent, independently-reviewable change of ~1–6 files that a single
-  developer pass (~150k tokens) can implement AND test. FOLD trivial/mechanical changes into the
-  nearest related feature task rather than giving them their own cycle; SPLIT anything too big for
-  one pass. Set \`size\` (S/M/L) and avoid S.
-- FEWER CYCLES: you MAY combine a feature's test-authoring and its conversion into ONE test-first
-  task (write the failing test, then implement until it is green; gate_expectation="green") instead
-  of two separate tasks, whenever the feature is small/clear enough to do in a single pass. Reserve
-  the separate red-baseline test task for large/risky features where the failing spec is worth
-  reviewing on its own before conversion.
-- READ the actual code to anchor the file lists. Do NOT invent files.
-- INVENTORY THE FULL SURFACE: grep the repo for EVERY occurrence of the patterns/APIs/symbols the
-  GOAL replaces or touches — do NOT extrapolate from a few sample files. Every hit must be covered
-  by some task (or explicitly noted out-of-scope in notes). Record the hit counts in notes so
-  coverage is checkable afterwards.
-- If anything material is uncertain (an ambiguous contract, an unclear precedence rule, how the
-  reference solved it), put it in research_requests INSTEAD of guessing. Return empty
-  research_requests only when you are confident the plan is trustworthy.
-- Do NOT write any files or change any code in this mode. Return the plan via the schema.`;
-
-const researchPrompt = (q) => `
-You are the RESEARCH agent (read-only). Answer ONE specific question the Planner needs resolved
-before it commits to a plan. Be concrete: cite file paths, commit refs, code excerpts, or live
-docs. Do NOT modify anything.
-${CONTEXT}
-QUESTION:
-${q}
-
-Inspect the target repo and especially the REFERENCE (a completed example) where relevant. If the
-question is about an external spec/API, you may search the web. Return your answer via the schema
-with an actionable recommendation.`;
-
-const planPrompt = (task, research) => `
-You are the PLANNER producing a develop-plan for ONE task. Verify it against the real code, then
-emit the minimal set of steps to satisfy the task's acceptance — no gold-plating, no scope creep.
-${CONTEXT}
-TASK: ${task.id} — ${task.title}
-  ${task.description}
-  files (likely): ${(task.files || []).join(', ') || '(discover)'}
-  acceptance: ${task.acceptance || '(define it)'}
-  tests_required (from decomposition): ${task.tests_required} — ${task.tests_rationale || ''}
-${research.length ? `RESEARCH you requested:\n${research.map((r) => `  Q: ${r.question}\n  A: ${r.findings}\n  ⇒ ${r.recommendation || ''}`).join('\n')}` : ''}
+const developPrompt = (section, round, reviewPath) => {
+  const gxLine = section.gate === 'red-baseline'
+    ? 'red-baseline — AUTHOR this section\'s tests; they MUST FAIL because the code is not converted yet. Report test_outcome="failed-expected" once they run and fail for the RIGHT reason (asserting the not-yet-built target behavior), or "failed-unexpected" if they fail for a wrong reason (parse error, missing fixture).'
+    : section.gate === 'build-only'
+      ? 'build-only — no test pass/fail requirement; just keep the build green.'
+      : 'green — this section\'s selector tests must RUN and PASS (test_outcome="passed"). Scope the test run to THIS section (the rest of the suite may be intentionally red mid-migration).';
+  return `
+You are the DEVELOPER. Implement ${sectionRef(section.id)}. Build ONLY this section minimally and
+surgically; match conventions; NO scope creep beyond it.
+${ENV}
+SECTION: ${section.id} — ${section.title}
+GATE EXPECTATION: ${gxLine}
+${round === 1
+  ? `This is round 1 of this section: the unstaged working tree is clean (prior sections are STAGED = the
+accepted baseline). Implement this section from scratch on top of that baseline.`
+  : reviewPath
+    ? `A prior review flagged issues — READ ${reviewPath} and resolve exactly those. Your earlier work for
+this section is already in the UNSTAGED working tree: build ON it, do NOT revert or redo it.`
+    : `A prior round's build/verification was not green. Your earlier work is in the UNSTAGED working tree —
+re-run the gate (below), see what is failing, and fix it. Build ON your work; do NOT revert it.`}
+If ${dismissedFile(section.id)} exists, READ it first — it is YOUR running ledger of declined findings
+for THIS section, and it PERSISTS across resumes (so a resumed round-1 still has it): do not duplicate
+an entry, and do not re-litigate what you already declined. If a review RE-RAISES one as
+\`CONTESTS DISMISSAL:\`, you MUST FIX or ESCALATE it (never silently re-add the same dismissal).
 
 PROCEDURE:
-1. Read the task's files and the reference's equivalent (commit/pattern) so the plan mirrors the
-   proven approach. Where multiple valid implementations exist, apply the DECISION MATRIX and
-   record the choice in decision_notes.
-2. Confirm or correct tests_required, gate_expectation (green | red-baseline | build-only), and
-   test_selector for THIS task; if tests are needed, say exactly what to test (tests_plan). If the
-   suite is intentionally red mid-run, a conversion task is green only against its OWN selector;
-   a test-authoring task is "done" when its new tests fail as intended (red-baseline).
-3. If a material uncertainty remains, return it in research_requests (the conductor will fetch an
-   answer and call you again). Return empty research_requests when ready to hand off to Develop.
-4. Do NOT modify code in this mode. Return the plan via the schema.
-${MATRIX}`;
-
-const developPrompt = (task, plan, repairOf) => {
-  const gx = plan.gate_expectation || task.gate_expectation || 'green';
-  const sel = plan.test_selector || task.test_selector || '';
-  const needTests = (plan.tests_required ?? task.tests_required) === true;
-  const gxLine = gx === 'red-baseline'
-    ? 'red-baseline — AUTHOR the tests for this feature; they MUST FAIL because the code is not converted yet. Report test_outcome="failed-expected" once they run and fail for the RIGHT reason (asserting the not-yet-built target behavior), or "failed-unexpected" if they fail for a wrong reason (a parse error, missing fixture, etc.).'
-    : gx === 'build-only'
-      ? 'build-only — no test pass/fail requirement; just keep the build green.'
-      : 'green — this task\'s tests must PASS (test_outcome="passed").';
-  return `
-You are the DEVELOPER. Implement the plan EXACTLY — minimally and surgically. Match conventions.
-NO opportunistic refactors, NO scope creep beyond the plan.
-${CONTEXT}
-TASK: ${task.id} — ${task.title}
-${repairOf ? `THIS IS A REPAIR ROUND. Address ONLY these items from the prior review/gate failure:` : `PLAN STEPS:`}
-${(plan.steps || []).map((s, i) => `  ${i + 1}. ${s}`).join('\n')}
-FILES: ${(plan.files || task.files || []).join(', ')}
-TESTS: ${needTests ? `REQUIRED — ${plan.tests_plan || 'cover the risky path with unit or integration tests'}` : 'not required for this task'}
-GATE EXPECTATION: ${gxLine}
-TEST SELECTOR (scope the test run to THIS task — the rest of the suite may be intentionally red mid-run): ${sel || '(none — run the smallest relevant set)'}
-
-PROCEDURE (IPO):
-0. BASELINE: the accepted baseline is already STAGED. \`git -C ${REPO} diff\` therefore shows only
-   this cycle's work: empty on the first round of a task, or your own prior-round work on a repair
-   round (build ON it — do not revert it). Do not stage anything yourself.
-1. Implement the steps. Author/extend tests as the gate expectation requires. If the test harness
-   is missing: ${GATES.testSetup || '(stand it up minimally)'}. Leave the lines you TOUCH a little
-   better (obvious one-line wins are welcome), but do NOT refactor or fix unrelated/pre-existing code.
-   Before returning, SELF-REVIEW your own diff and fix anything obviously wrong — catching it here
-   saves a whole extra review→fix round.
-2. Run the GATES and capture results:
-     build: ${GATES.build ?? '(skip — none configured)'}
-     test (scope to the selector above when set): ${GATES.test ?? '(skip — none configured)'}
-   Set build_passed, and set test_outcome to passed | failed-expected | failed-unexpected | not-run.
-   SANITY-CHECK the runner REALLY executed your tests: set tests_run_count to the count the runner
-   reports (0 = your selector matched NOTHING — that is a FALSE green, fix the selector and re-run;
-   -1 if the runner prints no count). Some runners silently ignore extra path arguments — when in
-   doubt run one file per invocation or use the runner's filter flag.
-3. Do NOT chase whole-suite green — only this task's scoped tests matter. Never weaken/delete tests
-   or disable checks. Build/lint must always pass; if you cannot make it pass within scope, leave it
-   failing and explain in gate_output.
-4. LEAVE CONTENT UNSTAGED — do NOT \`git add\` content and do NOT commit. EXCEPTION: for any file you
-   CREATE, run \`git -C ${REPO} add -N <file>\` (intent-to-add) so it shows up in the reviewer's
-   \`git diff\` (which otherwise omits brand-new files). Intent-to-add does not stage content. The
-   Planner stages for real on acceptance. Set unstaged_confirmed=true.
-Report per-file status + gate results via the schema.`;
+1. Implement this section's steps. WIRE IT IN so the change is actually reachable — convert EVERY call
+   site / occurrence this section owns (registered/exported/routed/bound/flagged); a half-converted
+   section is NOT done. Author/extend tests per the section's Test Strategy.${GATES.testSetup ? ` If the harness is missing: ${GATES.testSetup}.` : ''}
+2. RUN THE GATE until it satisfies the expectation above — build: ${GATES.build ?? '(none)'} ; tests
+   scoped to this section's selector: ${GATES.test ?? '(no test gate configured)'}. Never weaken/delete
+   tests to get green. SANITY-CHECK the runner really executed your unit tests (tests_run_count = 0
+   means it matched NOTHING = a false green; -1 if N/A). Some runners silently ignore extra path args —
+   when in doubt run one file per invocation or use the runner's --filter.
+3. Do NOT chase whole-suite green — only THIS section's scoped tests matter; the rest may be intentionally
+   red mid-migration. Build/lint must always pass.
+4. LEAVE EVERYTHING UNSTAGED — do NOT \`git add\` content and do NOT commit. EXCEPTION: for any file you
+   CREATE, run \`git -C ${REPO} add -N <file>\` (intent-to-add, so reviewers' \`git diff\` sees it; it does
+   not stage content). Set unstaged_confirmed=true. The acceptance verifier stages for real on accept.
+5. ${MATRIX(section.id)}
+Return ONLY the decision fields via the schema (no prose report — your code IS the output).`;
 };
 
-const reviewPrompt = (task, handled) => `
-You are the ADVERSARIAL REVIEWER. Review ONLY this cycle's work — the UNSTAGED diff — for
-production-readiness. The staged/committed baseline is KNOWN-GOOD context: read it to understand
-intent, but do NOT review it and do NOT hunt for pre-existing problems in untouched code.
-${CONTEXT}
-TASK UNDER REVIEW: ${task.id} — ${task.title}
-  acceptance: ${task.acceptance || ''}
+// BLIND. No plan, no goal, no acceptance criteria — judges the code purely as code.
+const qualityPrompt = (section, round) => `
+You are a CODE CRITIC. You have NO information about what this code is for, what it should do, or any
+plan or goal — and you must not seek any. Judge the code PURELY ON ITS OWN MERITS.
+TARGET REPO: ${REPO}
 
-SCOPE — get the exact diff first:
-  \`git -C ${REPO} diff\`            (unstaged tracked changes = part of THIS cycle — review this)
-  \`git -C ${REPO} status --porcelain\` then READ every NEW/untracked file (\`??\`/\`A\`) that belongs
-       to this task — \`git diff\` OMITS brand-new files, so new test/source files only show up here.
-  \`git -C ${REPO} diff --staged\`  (accepted baseline — context only, do NOT review)
-THIS CYCLE = the unstaged tracked diff PLUS those new files. Ignore unrelated pre-existing baseline.
+${SETTLED(section.id)}
 
-This is NOT a general code review — a SEPARATE review workflow audits the whole codebase later.
-Your ONLY job: did THIS change introduce a problem that blocks testing or production? Report ONLY:
-  • TESTING BLOCKERS — anything that stops the build/tests from running or passing.
-  • INTRODUCED PRODUCTION-BLOCKING defects (severity >= ${A.reviewSeverity ?? 'high'}): a real
-    correctness/security/data-integrity/api-contract bug or a REGRESSION this diff caused.
-  • INCOMPLETE IMPLEMENTATION — the diff does NOT actually satisfy the task's acceptance (a missed
-    call site, an unconverted branch, a test asserting the wrong behavior). Report as correctness/high.
-  • (optional) a genuinely OBVIOUS one-line in-scope improvement to a line THIS diff touched.
-Do NOT report — drop silently — anything that is: pre-existing (not caused by this diff), medium/
-low severity, stylistic, "could be more defensive", speculative, a redesign, or out of the GOAL's
-scope. Those are explicitly someone else's job. An empty findings list is the NORMAL, GOOD outcome.
-For each finding set introduced_by_this_change (must be TRUE — you don't report pre-existing) and
-business_logic, with a specific file:line and a minimal fix direction.
-Do NOT re-report ALREADY HANDLED items:
-${handled.length ? handled.map((t) => `  - ${t}`).join('\n') : '  (none yet)'}
-Return via the schema (usually an empty array).`;
+SCOPE — review ONLY this cycle's UNSTAGED work:
+  \`git -C ${REPO} diff\`                    (unstaged tracked changes — review this)
+  \`git -C ${REPO} status --porcelain\` then READ every NEW/untracked file (\`??\`/\`A\`) — \`git diff\` OMITS new files.
+  \`git -C ${REPO} diff --staged\` is the ACCEPTED baseline (prior sections) — context only, do NOT review it.
 
-const triagePrompt = (task, items, round, gateMet, gateDesc, gateOutput, isLastRound) => `
-You are the PLANNER in TRIAGE mode — and the orchestrator-of-record for the git baseline. Confirm
-each finding against the ACTUAL unstaged diff, route it via the decision matrix, and either ACCEPT
-(stage) the round or produce the next fix-plan. Reject false positives and scope creep ruthlessly.
-${CONTEXT}
-TASK: ${task.id} — ${task.title}   (round ${round} of max ${MAX_ROUNDS})
-GATE EXPECTATION: ${gateDesc}
-GATE OUTCOME: ${gateMet ? 'MET — the gate expectation is satisfied' : 'NOT MET — see detail:'}
-${gateMet ? '' : (gateOutput || '(no detail)')}
+Report ONLY production-blocking defects INTRODUCED by this diff: real correctness/security/
+data-integrity/error-handling/resource/concurrency/api-contract bugs, or anything that breaks the
+build or tests. DROP silently: anything pre-existing in the baseline, style, naming, medium/low polish,
+speculation, redesigns. An EMPTY result is the normal, GOOD outcome.
 
-CANDIDATE FINDINGS (finding_id :: file :: category/severity :: introduced/business :: title):
-${items.length ? items.map((i) => `  - ${i.id} :: ${i.f.file} :: ${i.f.category}/${i.f.severity} :: introduced=${i.f.introduced_by_this_change} business=${i.f.business_logic} :: ${i.f.title}\n      ${i.f.detail}\n      suggested: ${i.f.suggested_fix || '(none)'}`).join('\n') : '  (none — reviewer returned clean)'}
-${MATRIX}
+WRITE your findings to ${qualityFile(section.id, round)} (create ${STATE_DIR}/ if needed): one section
+per defect — file:line, what's wrong, why it's production-blocking, a concrete fix. If none, write
+exactly "No production-blocking defects found." Then return clean (true if NO findings, including no
+contests) + issue_count + contested_dismissals via the schema. Do NOT modify source, stage, or commit.`;
+
+const acceptancePrompt = (section, round) => `
+You are the ACCEPTANCE VERIFIER — the final, plan-aware gate for ONE section. The blind code review
+already passed. Verify, against the repo itself, that THIS section is fully delivered and nothing
+regressed. Read ${sectionRef(section.id)}.
+${ENV}
+SECTION: ${section.id} — ${section.title}   (gate: ${section.gate})
+
+${SETTLED(section.id, false)}
+OVERRIDE: ${dismissedFile(section.id)} entries are the developer's judgment calls. You are plan-aware —
+if a dismissed item ACTUALLY breaks one of this section's acceptance criteria, leaves it unreachable,
+or causes a regression, that OVERRIDES the dismissal: fail acceptance for it and record it in your file.
+
+SCOPE — this cycle's work is the UNSTAGED diff plus new files:
+  \`git -C ${REPO} diff\` + \`git -C ${REPO} status --porcelain\` (READ new files).
+  \`git -C ${REPO} diff --staged\` = accepted baseline (prior sections — compare against it for regressions).
 
 PROCEDURE:
-1. Verify each finding against \`git -C ${REPO} diff\`. Route via the matrix. For ACTIONABLE items
-   write a precise minimal fix_instruction.
-2. REGRESSION CHECK: compare the unstaged diff against the staged baseline
-   (\`git -C ${REPO} diff --staged\`). If this cycle regressed previously-accepted behavior, raise
-   it yourself as an ACTIONABLE finding (set regression_found=true).
-3. DOCUMENT — keep this MINIMAL to conserve context (agents own the files; create headers if missing):
-     • NEEDS_USER → append to ${STATE_DIR}/NEEDS-DECISION.md (title, where, what, options, recommendation).
-     • any blocking=true → ALSO append a consolidated entry to ${STATE_DIR}/BLOCKERS.md.
-     • REJECT / dropped items → write NOTHING. Do not log mediums, lows, pre-existing, or scope-creep —
-       the separate code-review workflow handles them. Logging them just wastes context.
-   Set wrote_logs=true only if you appended a NEEDS_USER or blocker entry.
-4. DECIDE (THIS IS THE FINAL ALLOWED ROUND: ${isLastRound ? 'YES' : 'no'}):
-   • If the GATE OUTCOME is MET and there are ZERO ACTIONABLE findings: ACCEPT — run
-     \`git -C ${REPO} add <the task's changed AND newly-created files>\` (NEVER commit), set
-     staged=true & accepted=true. (For a red-baseline task this means the authored tests correctly
-     FAIL as intended — a valid, stageable "done": the failing test is the conversion's spec.)
-   • LAST-ROUND + GATE MET: if this IS the final allowed round AND the gate is MET but a few minor
-     ACTIONABLE easy-wins remain, ACCEPT ANYWAY — stage (accepted=true, staged=true) and DROP the
-     leftover easy-wins silently (do NOT log them; they are below the bar). Only REFUSE
-     (accepted=false) if a remaining item is a HIGH/CRITICAL INTRODUCED must-fix or a testing blocker.
-   • Otherwise (gate NOT met, or a real must-fix remains, and not blocked): accepted=false; return a
-     tight next_fix_plan (steps+files) addressing ONLY the gate problem + must-fix ACTIONABLE items.
-     Leave the tree UNSTAGED. Do NOT treat an intentionally-red suite as a failure.
-   • If any verdict.blocking is true: set has_blocker=true (conductor halts the whole run); do NOT
-     stage. The working tree is left intact for the user.
-Return everything via the schema.`;
+1. For EACH acceptance criterion of THIS section, find concrete evidence it holds (a diff hunk, a passing
+   test, an observed behavior). Mark met / not-met with file:line / test-name / output evidence.
+2. REACHABILITY: prove every integration point this section owns is satisfied — every call site
+   converted, route mounted, symbol exported/bound/flagged (grep to prove it). A half-converted section
+   is not done.
+3. REGRESSION: compare the unstaged diff against the staged baseline; confirm no previously-accepted
+   behavior was changed or broken.
+4. Run this section's gate and record the real outcome (build: ${GATES.build ?? '(none)'} ; tests scoped
+   to this section: ${GATES.test ?? '(none)'}). For gate=green the selector tests must PASS; for
+   gate=red-baseline the authored tests must FAIL as intended (that failing test IS the spec — a valid,
+   stageable "done"); for gate=build-only just build green. Do NOT treat the intentionally-red rest of
+   the suite as a failure. If a configured MCP/tool is unavailable here, say so in the file (do not fake
+   it) and return pass=false.
+5. WRITE ${acceptanceFile(section.id, round)} (create ${STATE_DIR}/ if needed): the per-criterion table,
+   the reachability + regression result, the gate output, and each gap (title + file:line + fix) — or
+   "All criteria met; reachable; no regression."
+6. DECIDE:
+   • All criteria met, reachable, gate satisfied, no regression → \`git -C ${REPO} add <this section's
+     changed AND newly-created files>\` (NEVER commit); return pass=true, staged=true. The baseline now
+     advances to include this section.
+   • LEGITIMATE NO-OP: if this section genuinely requires NO code change because the staged baseline
+     already satisfies every one of its criteria, that is a valid pass — return pass=true AND staged=true
+     (there is simply nothing to add). Say so explicitly in your file. Do NOT invent changes to justify it.
+   • Otherwise → return pass=false (do NOT stage); the gaps you wrote drive the next develop round.
+Do NOT modify source code. Return ONLY the decision fields via the schema.`;
 
-// Lean accept — the common happy path (clean review + gate met). A full triage prompt + opus is
-// wasted when there is nothing to triage; this does the two things that still matter (regression
-// spot-check + staging) on the cheaper review tier.
-const acceptPrompt = (task, round, gateDesc) => `
-You are finalizing an ACCEPT for one task: the reviewer found NOTHING and the gate expectation is
-met. Two jobs only — regression spot-check, then stage.
-${CONTEXT}
-TASK: ${task.id} — ${task.title}   (round ${round})
-GATE: ${gateDesc}
-1. REGRESSION SPOT-CHECK: \`git -C ${REPO} diff --stat\` (this cycle) vs
-   \`git -C ${REPO} diff --staged --stat\` (accepted baseline). Confirm the unstaged changes
-   plausibly belong to THIS task and did not clobber previously-staged work. If something looks
-   regressed, return accepted=false, regression_found=true, and a tight next_fix_plan instead.
-2. STAGE: \`git -C ${REPO} add <the task's changed AND newly-created files>\` (NEVER commit), then
-   confirm \`git -C ${REPO} diff\` is empty for those files.
-Return verdicts=[], accepted=true, staged=true, has_blocker=false via the schema.`;
-
-const critiquePrompt = (tasks) => `
-You are an INDEPENDENT PLAN CRITIC (read-only). A planner decomposed the GOAL into the task list
-below. Your ONLY job is to find what the plan MISSED — not to restyle or re-architect it.
-${CONTEXT}
-PROPOSED TASK LIST:
-${tasks.map((t) => `  - ${t.id} [deps: ${(t.depends_on || []).join(',') || '-'}] gate=${t.gate_expectation || 'green'} files=${(t.files || []).join(', ') || '(discover)'}\n      ${t.title} — ${t.acceptance || ''}`).join('\n')}
+// Whole-PLAN coverage critic (refine phase). Reads ALL sections; greps the WHOLE surface.
+const refinePrompt = () => `
+You are an INDEPENDENT PLAN CRITIC (read-only). The orchestrating agent decomposed a breadth-spanning
+GOAL into ordered SECTIONS in plan mode. Find what the plan MISSED or got WRONG against the REAL repo —
+across the WHOLE change surface — not to restyle or re-architect it. An empty result (verdict="ready")
+is a GOOD outcome. Read ${PLAN_REF} (every "## Section:" block).
+${ENV}
 
 PROCEDURE:
-1. Re-derive the change surface YOURSELF: grep the target repo for the patterns/APIs/symbols the
-   GOAL replaces or touches. Do NOT trust the plan's file lists — verify them.
-2. Compare every hit against the task list. Report a gap ONLY for material misses WITHIN the GOAL:
-   an uncovered call site/feature/file, a missing prerequisite (e.g. no test-harness task), a
-   dependency-ordering error, or a task too large for one ~150k-token develop pass.
-3. Do NOT report style preferences, alternative decompositions, or anything beyond the GOAL.
-   An empty gaps list is a GOOD outcome. Do not modify any files.
-Return via the schema with file:line evidence for each gap — no evidence, no gap.`;
-
-const amendPrompt = (tasks, critique) => `
-You are the PLANNER amending your task plan. An independent critic verified it against the actual
-repo and found coverage gaps. Fold the REAL ones in (into an existing task where natural; as a new
-or split task where needed; reorder if a dependency was wrong). REJECT any gap that is out of the
-GOAL's scope and say why in notes.
-${CONTEXT}
-CURRENT PLAN:
-${JSON.stringify(tasks, null, 2)}
-
-CRITIC'S GAPS:
-${critique.gaps.map((g, i) => `  ${i + 1}. ${g.title}\n     evidence: ${g.evidence}\n     suggestion: ${g.suggestion || '(none)'}`).join('\n')}
-
-Return the COMPLETE amended task list via the schema (research_requests=[]). Do NOT write files.`;
+1. RE-DERIVE the change surface YOURSELF from the goal: grep the target repo for EVERY occurrence of the
+   patterns/APIs/symbols the goal replaces or touches. Do NOT trust the plan's file lists — verify them.
+   Record hit counts so coverage is checkable.
+2. Compare every hit + integration point against the sections. Report a GAP only for a MATERIAL miss
+   WITHIN the goal: an uncovered call site/file/feature, a missing prerequisite (e.g. no test-harness
+   section before a red-baseline one), a dependency-ORDERING error (a consumer section before its
+   producer), an acceptance criterion with no implementing step, a test strategy that won't prove the
+   criteria, or a section too big for one ~150k-token develop pass (too_big=true; name it in notes).
+3. Raise a QUESTION only for something that genuinely BLOCKS safe implementation and only a human can
+   resolve. Provide file:line evidence for every gap — no evidence, no gap.
+Do NOT modify any files. Return your findings via the schema (the orchestrating agent acts on them).`;
 
 const sweepPrompt = (doneIds) => `
-You are the FINAL COMPLETENESS SWEEP. Every task is done and its work is STAGED. Verify, against
-the repo itself, that the GOAL is actually fully achieved — your job is to find what the task plan
-MISSED, not to re-review accepted work.
-${CONTEXT}
-COMPLETED TASKS: ${doneIds.join(', ')}
+You are the FINAL COMPLETENESS SWEEP. Every section is done and its work is STAGED. Verify, against the
+repo itself, that the GOAL is actually fully achieved — your job is to find what the plan MISSED, not to
+re-review accepted work. Read ${PLAN_REF}.
+${ENV}
+COMPLETED SECTIONS: ${doneIds.join(', ')}
 
 PROCEDURE (read-only except step 4):
-1. RE-DERIVE the change surface from the GOAL: grep the target repo for every pattern/API/symbol
-   the goal replaces or touches. Any hit that should have been converted but wasn't = a gap.
-2. Run the FULL gates once and record the real outcome:
-     build: ${GATES.build ?? '(none configured)'}
-     test:  ${GATES.test ?? '(none configured)'}
-   If the GOAL implies whole-suite green at the end, a red suite is a gap. If a red tail is
-   expected, say which failures look expected vs surprising.
-3. Spot-check the staged diff (\`git -C ${REPO} diff --staged --stat\`): does it plausibly cover
-   every task's acceptance? Look for suspiciously-untouched areas the GOAL names.
-4. Write ${STATE_DIR}/SWEEP.md: the suite result, then each gap (title + file:line evidence + a
-   suggested follow-up task) — or "No gaps found." Do NOT modify source code, stage, or commit.
+1. RE-DERIVE the change surface from the GOAL: grep the target repo for every pattern/API/symbol the goal
+   replaces or touches. Any hit that should have been converted but wasn't = a gap.
+2. Run the FULL gates once and record the real outcome (build: ${GATES.build ?? '(none)'} ; test:
+   ${GATES.test ?? '(none)'}). If the GOAL implies whole-suite green at the end, a red suite is a gap; if
+   a red tail is expected, say which failures look expected vs surprising.
+3. Spot-check the staged diff (\`git -C ${REPO} diff --staged --stat\`): does it plausibly cover every
+   section's acceptance? Look for suspiciously-untouched areas the GOAL names.
+4. WRITE ${SWEEP_FILE}: the suite result, then each gap (title + file:line evidence + a suggested
+   follow-up section) — or "No gaps found." Do NOT modify source code, stage, or commit.
 Report ONLY material, in-GOAL gaps — not improvements, not pre-existing issues. Return via the schema.`;
 
-const baselinePrompt = () => `
-You are establishing the git BASELINE for this run in ${REPO}. The staging contract is:
-staged index = ACCEPTED baseline, unstaged working tree = the current cycle's work. Right now the
-tree may carry PRE-EXISTING local changes that belong to NO task and must not pollute task review
-diffs (so the reviewer's \`git diff\` shows only a task's own work).
-1. Run \`git -C ${REPO} status --porcelain\`.
-2. For every MODIFIED or otherwise-tracked-changed file, run \`git -C ${REPO} add\` on it to fold it
-   into the accepted baseline. Do NOT commit. Afterwards \`git -C ${REPO} diff\` must be EMPTY.
-3. Leave UNTRACKED files untouched — just list them in ignored_untracked.
-${A.baselineNote ? `Expected pre-existing changes (this is normal — stage them as baseline, do not revert): ${A.baselineNote}` : ''}
-Do NOT modify any source code. Return the lists + clean=true via the schema.`;
-
-const loaderPrompt = () => `
-You are the PROGRESS LOADER (read-only). Prepare a ${PHASE}-phase resume.
-1. Read ${STATE_DIR}/tasks.json if it exists → return its task array as "tasks" (set plan_missing
-   accordingly; return [] + plan_missing=true if absent).
-2. Read every ${STATE_DIR}/progress/*.json (if the dir exists) → return one {id,status} per file
-   as "done". Return [] if none.
-Do NOT modify anything. Return via the schema.`;
-
-const recorderPrompt = (task, record, total) => `
-You are the SCRIBE/RECORDER. Persist this task's outcome durably so a re-run resumes without
-redoing it. Do NOT modify source code.
-1. Ensure ${STATE_DIR}/progress/ exists.
-2. Write this EXACT JSON verbatim to ${STATE_DIR}/progress/${slug(task.id)}.json:
-${JSON.stringify(record)}
-3. Append a human-readable entry for this task to ${STATE_DIR}/CHANGELOG.md (what changed, files,
-   tests added, anything deferred/flagged).
-4. Rebuild ${STATE_DIR}/LEDGER.md from ALL ${STATE_DIR}/progress/*.json as a Markdown table:
-   columns: task | status | rounds | fixed | tests | deferred | needs-you | gates.
-   Heading: "# Upgrade ledger — N / ${total} tasks complete". Sort by task id.
-Return written=true and tasks_complete=N.`;
-
-const decomposeRecorderPrompt = (tasks) => `
-You are the SCRIBE. Persist the approved-pending task plan for the run phase to read.
-1. Ensure ${STATE_DIR}/ exists.
-2. Write this EXACT JSON verbatim to ${STATE_DIR}/tasks.json:
-${JSON.stringify({ runId: RUN_ID, goal: GOAL, generatedTasks: tasks }, null, 2)}
-3. Write a readable ${STATE_DIR}/TASKS.md table
-   (task | depends_on | tests? | gate_expectation | test_selector | risk | acceptance)
-   so the user can review/edit the plan before approving.
-Do NOT modify source code. Return written=true and tasks_complete=${tasks.length}.`;
-
 // =============================================================================
-// PHASE: plan — decompose the goal, persist tasks.json, then STOP for approval
+// PHASE: refine — adversarially review the WHOLE plan; return gaps/questions to the orchestrator. STOP.
+// (Writes nothing — the orchestrator reads the return value and relays to the user. Principle #6.)
 // =============================================================================
-if (PHASE === 'plan') {
-  phase('Decompose');
-  log(`decompose: goal "${GOAL.slice(0, 80)}${GOAL.length > 80 ? '…' : ''}" → ${REPO}`);
-
-  let research = [];
-  let plan = null;
-  for (let i = 0; i <= MAX_RESEARCH; i++) {
-    plan = await agent(decomposePrompt(research), roleOpts('planner', {
-      schema: DECOMPOSE_SCHEMA, phase: 'Decompose', label: i === 0 ? 'decompose' : `decompose r${i}`,
-    }));
-    const qs = (plan?.research_requests || []).filter(Boolean);
-    if (!qs.length || i === MAX_RESEARCH) break;
-    log(`decompose: planner asked ${qs.length} research question(s) (round ${i + 1})`);
-    phase('Research');
-    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), roleOpts('research', {
-      schema: RESEARCH_SCHEMA, phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
-    }))));
-    research = research.concat(answers.filter(Boolean));
-  }
-
-  let tasks = (plan?.tasks || []);
-
-  // Independent coverage critic: a SECOND agent re-derives the change surface from the repo and
-  // flags material gaps BEFORE the user approves the plan. One planner pass anchors on what it
-  // happened to read; the critic greps the whole surface, so misses get caught while they are
-  // still cheap (a plan edit, not a missed task discovered post-run). Disable with planCritic:false.
-  if (A.planCritic !== false && tasks.length) {
-    phase('Critique');
-    const critique = await agent(critiquePrompt(tasks), roleOpts('review', {
-      schema: CRITIQUE_SCHEMA, phase: 'Critique', label: 'plan-critic',
-    }));
-    if ((critique?.gaps || []).length) {
-      log(`critique: ${critique.gaps.length} coverage gap(s) found — planner amending the plan`);
-      const amended = await agent(amendPrompt(tasks, critique), roleOpts('planner', {
-        schema: DECOMPOSE_SCHEMA, phase: 'Decompose', label: 'decompose:amend',
-      }));
-      if ((amended?.tasks || []).length) { plan = amended; tasks = amended.tasks; }
-    } else {
-      log('critique: no coverage gaps found');
-    }
-  }
-
-  phase('Record');
-  const rec = await agent(decomposeRecorderPrompt(tasks), roleOpts('scribe', {
-    schema: RECORD_SCHEMA, phase: 'Record', label: 'record:tasks.json',
+if (PHASE === 'refine') {
+  phase('Refine');
+  log(`refine: critiquing the plan${PLAN_PATH ? ` at ${PLAN_PATH}` : ' (inline)'} against ${REPO} (${ALL_SECTIONS.length} section[s])`);
+  const critique = await agent(refinePrompt(), roleOpts('refine', {
+    schema: REFINE_SCHEMA, phase: 'Refine', label: 'plan-critic',
   }));
-  log(`decompose complete: ${tasks.length} task(s) written to ${STATE_DIR}/tasks.json (recorded=${rec?.written === true})`);
+  const gaps = critique?.gaps || [];
+  const questions = critique?.questions || [];
+  log(`refine: verdict=${critique?.verdict ?? 'ready'} — ${gaps.length} gap(s), ${questions.length} question(s)${critique?.too_big ? ' [a section is TOO BIG — split it]' : ''}`);
   return {
-    phase: 'plan',
+    phase: 'refine',
     runId: RUN_ID,
-    tasksFile: `${STATE_DIR}/tasks.json`,
-    taskCount: tasks.length,
-    tasks: tasks.map((t) => ({ id: t.id, title: t.title, depends_on: t.depends_on || [], tests_required: t.tests_required, risk: t.risk })),
-    notes: plan?.notes || '',
-    nextStep: `Review/edit ${STATE_DIR}/tasks.json, then re-invoke with phase:"run".`,
+    verdict: critique?.verdict ?? 'ready',
+    tooBig: critique?.too_big === true,
+    gaps,
+    questions,
+    notes: critique?.notes || '',
+    nextStep: questions.length
+      ? 'Relay the questions to the user (AskUserQuestion), fold the answers + gap fixes directly into the plan file (planPath), ensure a CLEAN unstaged working tree, then run phase:"run" with this SAME runId + planPath + the (possibly amended) sections list.'
+      : gaps.length
+        ? 'Fold the gap fixes directly into the plan file (planPath) — adding/splitting/reordering "## Section:" blocks as needed and updating the sections list to match — ensure a CLEAN unstaged working tree, then run phase:"run".'
+        : 'Plan is sound — ensure a CLEAN unstaged working tree, then run phase:"run" with this SAME runId + planPath + sections.',
   };
 }
 
 // =============================================================================
-// PHASE: run — execute the per-task plan→develop→review→triage loop
+// PHASE: run — execute the sections in order; per section: develop → BLIND quality (must pass) →
+// acceptance + regression (stages on pass; the baseline advances). A section that does NOT accept
+// HALTS the run (the staging boundary means the next section's blind diff must be clean — you cannot
+// start the next section while this one's work is unstaged).
+// PRECONDITION (orchestrator's job, #4): the target repo has a CLEAN unstaged working tree; any
+// already-accepted prior sections are STAGED. The engine spawns NO baseline/loader/scribe agent —
+// the numbered review files + git staging are the only state + progress trail (#6/#10).
 // =============================================================================
-phase('Load');
-const loaded = await agent(loaderPrompt(), roleOpts('scribe', {
-  schema: LOADER_SCHEMA, phase: 'Load', label: 'load-plan',
-}));
-if (loaded?.plan_missing || !(loaded?.tasks || []).length) {
-  throw new Error(`No approved task plan at ${STATE_DIR}/tasks.json — run phase:"plan" first, then approve it.`);
+if (!ALL_SECTIONS.length) {
+  throw new Error('args.sections is required for phase:"run": an ordered array of { id, title, gate } the main agent extracted from the approved plan (each maps to a "## Section: <id>" block). Got none.');
 }
 
-const allTasks = loaded.tasks;
-const doneById = new Map((loaded.done || []).map((d) => [d.id, d.status]));
-// Dependency-respecting order: tasks already appear ordered from decomposition; we keep that
-// order and simply skip tasks whose recorded status is terminal-done.
-// "done" covers all accepted variants: "done", "done (with follow-ups)", "done (residual advisory)".
-const isDone = (id) => { const s = String(doneById.get(id) ?? ''); return s.startsWith('done') || s === 'clean'; };
-const notDone = allTasks.filter((t) => !isDone(t.id));
-// Optional scope: run only an explicit subset of task ids (must be dependency-closed). Lets us
-// run "just the first section" without mutating the approved tasks.json.
+// Resume / partial-slice scoping (control plane, supplied by the orchestrator after it reconstructs
+// progress from git-staging + the review-file trail — there is no progress file by design, #6/#10).
+//   runOnly: [ids]  — run exactly these sections (in plan order).
+//   startAt: id     — run from this section to the end (skip already-accepted earlier ones).
 const runOnly = Array.isArray(A.runOnly) && A.runOnly.length ? A.runOnly : null;
-const pending = runOnly ? notDone.filter((t) => runOnly.includes(t.id)) : notDone;
-log(`resume: ${allTasks.length - notDone.length}/${allTasks.length} done; ${pending.length} to process${runOnly ? ` (scoped to ${runOnly.length} task[s] via runOnly)` : ''}`);
-
-// One-time baseline prep: fold any pre-existing modified TRACKED files into the staged baseline so
-// each task's UNSTAGED diff is purely that task's work (keeps the reviewer's git-diff scope clean).
-if (A.prepBaseline !== false && pending.length) {
-  const base = await agent(baselinePrompt(), roleOpts('scribe', {
-    schema: BASELINE_SCHEMA, phase: 'Load', label: 'baseline-prep',
-  }));
-  log(`baseline: staged ${(base?.staged_files || []).length} pre-existing file(s); ignoring ${(base?.ignored_untracked || []).length} untracked`);
+let pending = ALL_SECTIONS;
+if (runOnly) {
+  pending = ALL_SECTIONS.filter((s) => runOnly.includes(s.id));
+} else if (A.startAt) {
+  const i = ALL_SECTIONS.findIndex((s) => s.id === A.startAt);
+  pending = i >= 0 ? ALL_SECTIONS.slice(i) : ALL_SECTIONS;
 }
+const isFullRun = !runOnly && !A.startAt;   // a sweep is only meaningful when the whole goal was processed
+log(`run: ${pending.length}/${ALL_SECTIONS.length} section(s) to process${runOnly ? ` (runOnly: ${runOnly.join(', ')})` : A.startAt ? ` (startAt: ${A.startAt})` : ''} [maxRounds=${MAX_ROUNDS}]`);
 
-const ledger = [];
+const ledger = [];               // in-memory, returned to the orchestrator (NOT a written file — #6)
 let halted = false;
-let blockerReason = '';
+let haltReason = '';
+const doneIds = [];
 
-for (const task of pending) {
+for (const section of pending) {
   if (halted) break;
-  // Budget guard: when the user set a token target (e.g. "+500k"), stop CLEANLY between tasks
-  // rather than letting an agent() call throw mid-task. Completed work is recorded; resume re-runs
-  // the same args and skips done tasks.
-  if (budget.total && budget.remaining() < (A.minTaskBudget ?? 150_000)) {
-    log(`⏸ stopping before ${task.id}: ~${Math.round(budget.remaining() / 1000)}k tokens remain (< minTaskBudget) — resume with the same args to continue`);
-    break;
-  }
-  // Guard: a dependency is "satisfied" once it reached a done* status (gate met). A dependency that
-  // ended gate-UNMET (functionally broken) is a TRUE blocker — we can't safely build on it.
-  const unmetDep = (task.depends_on || []).find((d) => !isDone(d));
-  if (unmetDep) {
-    halted = true;
-    blockerReason = `Task ${task.id} cannot proceed: dependency ${unmetDep} did not reach a gate-met (done) state.`;
-    await agent(`You are the SCRIBE. Append a clear entry to ${STATE_DIR}/BLOCKERS.md (create it with a "# Blockers" header if missing) recording that the run halted because: ${blockerReason}. Include what the user should check/fix and that the run can resume after. Do NOT modify source code. Return written=true.`, roleOpts('scribe', {
-      schema: RECORD_SCHEMA, phase: 'Triage', label: 'blocker:dependency',
-    }));
-    log(`✋ BLOCKER: ${blockerReason}`);
+  // Budget guard: when the user set a token target (e.g. "+500k"), stop CLEANLY between sections rather
+  // than letting an agent() call throw mid-section. Accepted sections are STAGED; resume continues.
+  if (budget.total && budget.remaining() < (A.minSectionBudget ?? 150_000)) {
+    halted = true;   // so the reason + resume instruction surface in the return value
+    haltReason = `Stopped before section ${section.id}: ~${Math.round(budget.remaining() / 1000)}k tokens remain (< minSectionBudget). Resume phase:"run" with startAt:"${section.id}".`;
+    log(`⏸ ${haltReason}`);
     break;
   }
 
-  log(`▶ task ${task.id} — ${task.title}`);
-  const record = { id: task.id, title: task.title, status: 'pending', rounds: 0, fixed: 0, tests_added: 0, deferred: 0, needsUser: 0, rejected: 0, regression: false, gates: null };
-  const handled = [];          // titles fed back to the reviewer so it won't re-report
-  const resolved = new Set();   // finding signatures (file:title) considered done
-
-  // ---- PLAN (+ ad-hoc research loop) ----------------------------------------
-  phase('Plan');
-  let research = [];
-  let plan = null;
-  for (let i = 0; i <= MAX_RESEARCH; i++) {
-    plan = await agent(planPrompt(task, research), roleOpts('planner', {
-      schema: PLAN_SCHEMA, phase: 'Plan', label: i === 0 ? `plan:${task.id}` : `plan:${task.id} r${i}`,
-    }));
-    const qs = (plan?.research_requests || []).filter(Boolean);
-    if (!qs.length || i === MAX_RESEARCH) break;
-    log(`  plan: ${qs.length} research question(s) before develop`);
-    phase('Research');
-    const answers = await parallel(qs.map((q) => () => agent(researchPrompt(q), roleOpts('research', {
-      schema: RESEARCH_SCHEMA, phase: 'Research', label: `research:${slug(q).slice(0, 24)}`,
-    }))));
-    research = research.concat(answers.filter(Boolean));
-  }
-  if (!plan) { record.status = 'skipped (no plan)'; ledger.push(record); continue; }
-
-  // ---- DEVELOP → REVIEW → TRIAGE loop ---------------------------------------
+  log(`▶ section ${section.id} — ${section.title} [gate=${section.gate}]`);
+  const rec = { id: section.id, title: section.title, gate: section.gate, status: 'pending', rounds: 0, qualityRounds: 0, contested: 0, staged: false, reachable: false, regression: false };
+  let reviewPath = '';           // the latest review file the developer must address (control: a path only)
+  let accepted = false;
   let round = 0;
-  let devPlan = plan;
-  let repair = false;
+
   while (round < MAX_ROUNDS) {
     round++;
-    record.rounds = round;
+    rec.rounds = round;
 
+    // ---- DEVELOP -----------------------------------------------------------
     phase('Develop');
-    const dev = await agent(developPrompt(task, devPlan, repair), roleOpts('develop', {
-      schema: DEVELOP_SCHEMA, phase: 'Develop', label: `develop:${task.id} r${round}`,
+    const dev = await agent(developPrompt(section, round, reviewPath), roleOpts('develop', {
+      schema: DEVELOP_SCHEMA, phase: 'Develop', label: `develop ${section.id} r${round}`,
     }));
-    const gx = devPlan.gate_expectation || task.gate_expectation || 'green';
-    const needTests = (devPlan.tests_required ?? task.tests_required) === true;
-    const gateMet = gateOk(gx, needTests, dev);
-    const gateDesc = `${gx}${(devPlan.test_selector || task.test_selector) ? ` (tests: ${devPlan.test_selector || task.test_selector})` : ''} — observed: build=${dev?.build_passed}, test_outcome=${dev?.test_outcome}`;
-    if (dev?.tests_written) record.tests_added++;
-    record.gates = { expectation: gx, met: gateMet, build: dev?.build_passed ?? null, test_outcome: dev?.test_outcome ?? null };
 
-    // Review the unstaged diff — skipped when the developer produced no changes (an empty diff
-    // has nothing to review; the gate outcome alone drives the next round).
-    const produced = (dev?.results || []).some((r) => r.status === 'CHANGED' || r.status === 'ADDED');
-    let review = null;
-    if (produced) {
-      phase('Review');
-      review = await agent(reviewPrompt(task, handled), roleOpts('review', {
-        schema: REVIEW_SCHEMA, phase: 'Review', label: `review:${task.id} r${round}`,
-      }));
-    } else {
-      log(`  review skipped r${round}: developer reported no changed/added files`);
-    }
-    const findings = (review?.findings || [])
-      .filter((f) => (SEV_RANK[f.severity] ?? 1) >= REVIEW_SEV)
-      .map((f, i) => ({ id: `${slug(task.id)}-r${round}-${i}`, f }))
-      .filter((x) => !resolved.has(`${x.f.file}:${x.f.title}`));
-
-    phase('Triage');
-    const isLastRound = round >= MAX_ROUNDS;
-    // Happy path (clean review + gate met): a LEAN accept — regression spot-check + stage — on the
-    // cheaper review tier. Findings or a missed gate get the full planner triage.
-    const lean = findings.length === 0 && gateMet && produced;
-    const triage = lean
-      ? await agent(acceptPrompt(task, round, gateDesc), roleOpts('review', {
-          schema: TRIAGE_SCHEMA, phase: 'Triage', label: `accept:${task.id} r${round}`,
-        }))
-      : await agent(triagePrompt(task, findings, round, gateMet, gateDesc, dev?.gate_output || '', isLastRound), roleOpts('planner', {
-          schema: TRIAGE_SCHEMA, phase: 'Triage', label: `triage:${task.id} r${round}`,
-        }));
-    if (triage?.regression_found) record.regression = true;
-
-    // Tally + remember terminal routings so the reviewer won't resurface them.
-    const byId = new Map(findings.map((x) => [x.id, x]));
-    const actionable = [];
-    for (const v of triage?.verdicts || []) {
-      const item = byId.get(v.finding_id);
-      if (v.decision === 'ACTIONABLE') { actionable.push(v); continue; }
-      if (item) { resolved.add(`${item.f.file}:${item.f.title}`); handled.push(item.f.title); }
-      if (v.decision === 'DEFER') record.deferred++;
-      else if (v.decision === 'NEEDS_USER') record.needsUser++;
-      else if (v.decision === 'REJECT') record.rejected++;
-    }
-    if ((triage?.new_tasks || []).length) record.spawnedTasks = (record.spawnedTasks || 0) + triage.new_tasks.length;
-
-    // Hard stop on a true blocker — halt the WHOLE run for user input.
-    if (triage?.has_blocker || (triage?.verdicts || []).some((v) => v.blocking)) {
+    if (dev?.needs_user === true) {
       halted = true;
-      blockerReason = triage?.summary || `Blocker raised during ${task.id} round ${round}.`;
-      record.status = 'BLOCKED';
-      log(`  ✋ BLOCKER during ${task.id} r${round} → halting run (see ${STATE_DIR}/BLOCKERS.md)`);
+      haltReason = `Developer halted for a user-only decision in section ${section.id} round ${round} (see ${NEEDS_USER}).`;
+      rec.status = 'BLOCKED (needs user)';
+      log(`  ✋ ${section.id} r${round}: developer escalated a user-only decision → halting (see ${NEEDS_USER})`);
       break;
+    }
+    if (dev?.unstaged_confirmed !== true) {
+      log(`  ⚠ ${section.id} r${round}: developer did not confirm work was left UNSTAGED — staging contract may be violated`);
+    }
+    if (dev?.dismissed_count) {
+      log(`  ${section.id} r${round}: developer declined ${dev.dismissed_count} finding(s) → ${dismissedFile(section.id)} (audit these at the end)`);
+    }
+    if (!gateOk(section.gate, dev)) {
+      // Gate not satisfied and no user escalation: give the developer another fresh round to fix it (it
+      // re-runs the gate and sees the failure live). RETAIN reviewPath — if a prior review is still open
+      // (e.g. a quality CONTEST not yet re-confirmed clean), the developer must keep addressing it while
+      // also fixing the gate; only a clean quality review advances the pointer. On round 1 it is '' anyway.
+      if (round >= MAX_ROUNDS) { log(`  ⚠ ${section.id} r${round}: gate(${section.gate}) not satisfied at round budget`); break; }
+      log(`  ↻ ${section.id} r${round}: gate(${section.gate}) not satisfied (build=${dev?.build_passed}, test=${dev?.test_outcome}, count=${dev?.tests_run_count}) → another develop round`);
+      continue;
+    }
+    // ---- QUALITY REVIEW (blind, must pass before acceptance) ----------------
+    // Run the blind review ONLY when the developer produced changes (an empty diff has nothing to
+    // review). Either way, acceptance still runs and judges the section against its criteria: a genuine
+    // no-op section (the staged baseline already satisfies it) passes there, and a section that SHOULD
+    // have changed files fails acceptance for unmet criteria. The harness never declares "done" itself.
+    if (dev?.produced) {
+      phase('Quality');
+      rec.qualityRounds++;
+      const quality = await agent(qualityPrompt(section, round), roleOpts('quality', {
+        schema: QUALITY_SCHEMA, phase: 'Quality', label: `quality ${section.id} r${round}`,
+      }));
+      if (quality?.contested_dismissals) {
+        rec.contested += quality.contested_dismissals;
+        log(`  ⚠ ${section.id} r${round}: quality CONTESTED ${quality.contested_dismissals} dismissal(s) — developer must fix or escalate, not re-dismiss`);
+      }
+      if (quality?.clean !== true) {
+        reviewPath = qualityFile(section.id, round);
+        if (round >= MAX_ROUNDS) { log(`  ⚠ ${section.id} r${round}: ${quality?.issue_count ?? '?'} quality issue(s) open at round budget (see ${reviewPath})`); break; }
+        log(`  ↻ ${section.id} r${round}: quality found ${quality?.issue_count ?? '?'} issue(s) → develop addresses ${reviewPath}`);
+        continue;
+      }
+      log(`  ✓ ${section.id} r${round}: quality review clean`);
+    } else {
+      log(`  ${section.id} r${round}: developer produced no changes — skipping blind review; acceptance will judge the section against its criteria`);
     }
 
-    // Accept: the Planner is authoritative — it stages on accept (clean, or last-round-gate-met
-    // with residual logged to ADVISORY). Trust triage.accepted, but require the gate to be met.
-    if (triage?.accepted === true && gateMet) {
-      const residual = (triage.wrote_logs && actionable.length) ? ` (+${actionable.length} residual→ADVISORY)` : '';
-      record.status = (record.deferred + record.needsUser > 0) ? 'done (with follow-ups)' : (residual ? 'done (residual advisory)' : 'done');
-      record.staged = triage?.staged === true;
-      record.fixed += Math.max(0, (triage.verdicts || []).filter((v) => v.decision === 'ACTIONABLE').length - actionable.length);
-      log(`  ✓ ${task.id} accepted after ${round} round(s) [gate=${gx} met] (staged=${record.staged}, fixed=${record.fixed}, flagged=${record.needsUser})${residual}`);
+    // ---- ACCEPTANCE REVIEW (plan-aware; stages on pass; baseline advances) ---
+    phase('Acceptance');
+    const acc = await agent(acceptancePrompt(section, round), roleOpts('acceptance', {
+      schema: ACCEPTANCE_SCHEMA, phase: 'Acceptance', label: `acceptance ${section.id} r${round}`,
+    }));
+    if (acc?.regression === true) rec.regression = true;
+    if (acc?.pass === true) {
+      rec.reachable = acc?.reachable === true;
+      if (acc?.staged === true) {
+        accepted = true;
+        rec.staged = true;
+        log(`  ✓ ${section.id}: acceptance PASSED — STAGED (reachable=${acc?.reachable}, gate=${acc?.suite_result || 'n/a'})`);
+        break;
+      }
+      // Passed but NOT staged: the staging boundary is broken — the next section's blind diff would
+      // include this section's unstaged work. Do NOT advance; halt for manual staging, then resume.
+      halted = true;
+      rec.status = 'done-unstaged (verifier passed but did NOT stage — stage manually, then resume)';
+      haltReason = `Section ${section.id} passed acceptance but its work was left UNSTAGED. Stage its files (git -C ${REPO} add <files>) so the baseline advances, then resume phase:"run" with startAt the NEXT section.`;
+      log(`  ✋ ${section.id}: acceptance passed but NOT staged → halting (staging boundary)`);
       break;
     }
-
-    // Not accepted → next round from the triage's fix-plan.
-    record.fixed += actionable.length;
-    if (isLastRound) {
-      record.status = gateMet ? 'needs-attention (unresolved must-fix)' : 'needs-attention (gate unmet)';
-      log(`  ⚠ ${task.id}: round budget (${MAX_ROUNDS}) exhausted — ${actionable.length} item(s) open, gate(${gx}) ${gateMet ? 'met' : 'UNMET'}`);
-      break;
-    }
-    devPlan = triage?.next_fix_plan && (triage.next_fix_plan.steps || []).length
-      ? { ...devPlan, steps: triage.next_fix_plan.steps, files: triage.next_fix_plan.files || devPlan.files }
-      : { ...devPlan, steps: actionable.map((v) => v.fix_instruction).filter(Boolean) };
-    repair = true;
-    log(`  ↻ ${task.id} r${round}: ${actionable.length} actionable + gate(${gx}) ${gateMet ? 'met' : 'UNMET'} → repair round`);
+    reviewPath = acceptanceFile(section.id, round);
+    if (round >= MAX_ROUNDS) { log(`  ⚠ ${section.id} r${round}: acceptance found ${acc?.gap_count ?? '?'} gap(s) at round budget (see ${reviewPath})`); break; }
+    log(`  ↻ ${section.id} r${round}: acceptance found ${acc?.gap_count ?? '?'} gap(s)${acc?.regression ? ' [REGRESSION]' : ''} → develop addresses ${reviewPath}`);
   }
-  if (record.status === 'pending') record.status = 'needs-attention (loop end)';
 
-  // ---- RECORD (durable per-task; survives kill/resume) ----------------------
-  phase('Record');
-  const rec = await agent(recorderPrompt(task, record, allTasks.length), roleOpts('scribe', {
-    schema: RECORD_SCHEMA, phase: 'Record', label: `record:${task.id}`,
-  }));
-  record.recorded = rec?.written === true;
-  doneById.set(task.id, record.status.startsWith('done') ? 'done' : record.status);
-  ledger.push(record);
+  if (accepted) {
+    // accepted is only ever true together with staged (the pass-but-unstaged case halts above), so this
+    // is unambiguously a staged "done".
+    rec.status = 'done (staged)';
+    doneIds.push(section.id);
+    ledger.push(rec);
+    continue;
+  }
+
+  // Not accepted (and not already a needs-user halt): HALT the run. The staging boundary means we
+  // cannot start the next section while this one's work is unstaged. Resume re-runs THIS section on
+  // its persisted unstaged work.
+  if (!halted) {
+    halted = true;
+    rec.status = 'needs-attention (round budget exhausted)';
+    haltReason = `Section ${section.id} did not reach acceptance within ${MAX_ROUNDS} rounds (see ${reviewPath || acceptanceFile(section.id, round)}). Its work is UNSTAGED; resolve with the user, then resume from this section.`;
+    log(`  ✋ ${section.id}: not accepted within ${MAX_ROUNDS} rounds → halting run (staging boundary)`);
+  }
+  ledger.push(rec);
+  break;
 }
 
 // =============================================================================
-// Final completeness sweep — only when EVERY task is done. An independent agent re-derives the
-// change surface from the GOAL (grep, full gates, staged-diff spot-check) and reports anything the
-// task plan missed to SWEEP.md. This is the "did we actually finish?" check the per-task loop —
-// which deliberately never looks beyond its own diff — cannot do. Disable with finalSweep:false.
+// Final completeness sweep — only on a FULL run (no partial slice) that processed every section without
+// halting. An independent agent re-derives the change surface from the GOAL (grep, full gates,
+// staged-diff spot-check) and reports anything the plan missed to SWEEP.md. This is the "did we actually
+// finish?" check the per-section loop — which never looks beyond its own diff — cannot do. Disable with
+// finalSweep:false.
 // =============================================================================
 let sweep = null;
-if (A.finalSweep !== false && !halted && ledger.length && allTasks.every((t) => isDone(t.id))) {
+const allDone = isFullRun && !halted && doneIds.length === ALL_SECTIONS.length && ALL_SECTIONS.length > 0;
+if (A.finalSweep !== false && allDone) {
   phase('Sweep');
-  sweep = await agent(sweepPrompt(allTasks.map((t) => t.id)), roleOpts('review', {
+  sweep = await agent(sweepPrompt(doneIds), roleOpts('sweep', {
     schema: SWEEP_SCHEMA, phase: 'Sweep', label: 'final-sweep',
   }));
   log(sweep?.complete
     ? `sweep: no goal-coverage gaps found (suite: ${sweep?.suite_result || 'n/a'})`
-    : `sweep: ${(sweep?.gaps || []).length} potential gap(s) — see ${STATE_DIR}/SWEEP.md`);
+    : `sweep: ${(sweep?.gaps || []).length} potential gap(s) — see ${SWEEP_FILE}`);
 }
 
 // =============================================================================
-// Result
+// Result (control plane → the orchestrating agent; durable progress lives in git + the review-file trail)
 // =============================================================================
+const status = halted
+  ? (haltReason.includes('needs user') || haltReason.includes('user-only') ? 'BLOCKED (needs user input)' : 'halted (section needs attention / budget)')
+  : allDone
+    ? 'done (all sections staged)'
+    : 'partial slice complete';
+
+log(`run: ${status} — ${doneIds.length}/${ALL_SECTIONS.length} section(s) done [${ledger.reduce((s, r) => s + r.qualityRounds, 0)} quality pass(es)]`);
+
 return {
   phase: 'run',
   runId: RUN_ID,
+  status,
   halted,
-  blockerReason: halted ? blockerReason : '',
+  haltReason: halted ? haltReason : '',
   stateDir: STATE_DIR,
+  sectionsDone: doneIds,
+  sectionsTotal: ALL_SECTIONS.length,
   sweep: sweep ? { complete: sweep.complete === true, gaps: (sweep.gaps || []).length, suite: sweep.suite_result || '' } : null,
-  summary: {
-    tasksProcessed: ledger.length,
-    done: ledger.filter((r) => r.status.startsWith('done')).length,
-    needsAttention: ledger.filter((r) => r.status.startsWith('needs-attention')).length,
-    blocked: ledger.filter((r) => r.status === 'BLOCKED').length,
-    totalFixed: ledger.reduce((s, r) => s + r.fixed, 0),
-    totalTestsAdded: ledger.reduce((s, r) => s + r.tests_added, 0),
-    totalDeferred: ledger.reduce((s, r) => s + r.deferred, 0),
-    totalNeedsUser: ledger.reduce((s, r) => s + r.needsUser, 0),
-    regressions: ledger.filter((r) => r.regression).length,
-  },
   ledger,
+  reviewTrail: `Numbered review files in ${STATE_DIR}/ (quality-review-<section>-rN.md, acceptance-review-<section>-rN.md) show every iteration; git staging marks each accepted section.`,
   followups: halted
-    ? `Run halted — see ${STATE_DIR}/BLOCKERS.md. Resolve, then resume with resumeFromRunId.`
-    : `Review ${STATE_DIR}/LEDGER.md, ${STATE_DIR}/NEEDS-DECISION.md${sweep && sweep.complete !== true ? `, ${STATE_DIR}/SWEEP.md (coverage gaps!)` : ''}, and the staged diff in ${REPO}.`,
+    ? `Run halted — read ${NEEDS_USER} (if a hard blocker) and the latest review file for the section in question, resolve with the user, confirm the tree still holds that section's in-progress UNSTAGED work, then resume: re-invoke phase:"run" with the same args + startAt:"<that section id>" (or runOnly).`
+    : allDone
+      ? `All sections done. Review the staged diff in ${REPO} (git diff --cached), the numbered review files + DISMISSED-*.md in ${STATE_DIR}/ (audit every declined finding)${sweep && sweep.complete !== true ? `, and ${SWEEP_FILE} (coverage gaps!)` : ''}. Run the full gates yourself. Nothing is committed — you commit.`
+      : `Partial slice complete (${doneIds.join(', ') || 'none'}). Reconstruct the next start point from git staging + the review trail and re-invoke phase:"run" with startAt the next section (or the full list to also run the final sweep).`,
 };

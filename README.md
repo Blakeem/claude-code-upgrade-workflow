@@ -1,169 +1,131 @@
 # upgrade-cycle
 
-**An autonomous, goal-driven workflow for Claude Code that upgrades and migrates codebases —
-safely, test-first, and mostly unattended.**
+An autonomous Claude Code workflow that drives **ONE breadth-spanning goal** to a production-ready,
+tested, staged state across your repo: a migration, a version upgrade, a framework port, or a subsystem
+refactor.
 
-You give it a detailed goal ("migrate this app's data model", "upgrade Angular 16 → 17", "port
-this service to the new framework"). It breaks the work into an ordered task plan, hands it to you
-for approval, then drives each task through a **plan → develop → review** loop until the change is
-implemented, tested, and production-safe — pausing only when it genuinely needs your decision.
+You describe the goal. In plan mode, Claude breaks it into **ordered sections** (each a bounded change),
+you approve the plan, an independent critic checks it against your real code, then a **develop → review →
+acceptance** loop builds each section and stages it. The accepted baseline advances section by section.
+You commit.
 
-It is **one file** (`upgrade-cycle.mjs`) plus a config you write. Everything project- and
-stack-specific lives in the config; the engine itself knows nothing about your language or
-framework.
+### What sets it apart
+
+This is a deliberately **lean** workflow. A default Claude workflow tends to spawn an agent for every
+step; this one engineers those away and follows a strict set of principles:
+
+- **No busy-work agents.** Decomposition and approval happen up front in plan mode. No agent is spawned
+  for a job another agent or the main session can already do.
+- **The plan travels verbatim.** Every agent reads the approved plan byte-for-byte from its file. The
+  harness routes only a section id and a round number, never paraphrased content, so nothing about your
+  plan is lost or reinterpreted.
+- **Blind, then plan-aware review.** A blind critic judges the code with no plan or goal (so it cannot
+  rubber-stamp "matches the plan"), then a plan-aware gate confirms the section's criteria, reachability,
+  and no regression.
+- **Staging advances section by section, never a commit.** Each accepted section is staged, which is how
+  the next section's diff stays clean and regressions show up. Only the acceptance gate stages, only on
+  pass. You always do the commit.
+- **No progress file.** Git staging plus the numbered review files are the durable record, so a stopped
+  run resumes from the repo itself.
 
 ---
 
-## What it actually does
+## Scope: is this the right tool?
 
-Planning is two-pass: a planner decomposes the goal into tasks, then an **independent critic**
-re-derives the change surface from the repo itself (grep, not memory) and the plan is amended to
-cover anything missed — all before you approve it.
+This workflow carries real overhead (plan mode, a plan review, a per-section build loop). It pays off
+for a goal big enough that it must be **decomposed into sections**:
 
-Then, for every task in the plan, it runs a tight loop:
+- ✅ **Right size:** one coherent goal spanning many files. Migrate a data model, upgrade a language or
+  runtime version, port a framework, refactor a subsystem. Each section is itself roughly a feature.
+- ❌ **One bounded feature** (a single MCP tool, endpoint, or form): use the sibling
+  [`feature-cycle`](https://github.com/Blakeem/claude-code-feature-workflow). A one-line change or a
+  rename: just make the edit.
+- ❌ **Several unrelated features:** run `feature-cycle` once per feature instead.
 
-1. **Plan** — a senior-engineer agent reads your code (and a reference example, if you provide one)
-   and writes a precise, minimal implementation plan. It can pull in ad-hoc research first.
-2. **Develop** — another agent implements the plan, writes/updates tests where the risk warrants
-   it, and runs your build + test commands.
-3. **Review** — an adversarial agent reviews **only the change just made** for production-blocking
-   problems.
-4. **Triage** — the planner decides: accept it, do another round, **flag** something that needs
-   your call, or **stop** if it hits a true blocker.
+---
 
-It works **test-first**: for risky features it writes the failing tests first, then converts the
-code until they pass. It leaves the code it touches a little better, fixes obvious wins and
-testing blockers, and **flags** (rather than silently changing) anything that's a real
-business-logic judgment call.
+## How to use it
 
-When **every** task is done, a **final completeness sweep** independently re-checks the whole goal:
-it greps for leftover instances of what was supposed to change, runs your full build + test gates,
-and writes any gaps to `SWEEP.md` — so "all tasks green" can't quietly mean "we missed a call site
-the plan never knew about."
+Clone the repo (it lands in a folder named `claude-code-upgrade-workflow`; the engine is the single file
+`upgrade-cycle.mjs`, nothing to build). Then **point Claude at that folder**, include the word
+"workflow", describe the goal, and give your build and test commands:
 
-### Safety model — why it won't cause regressions
+> "Use the upgrade-cycle **workflow** in `path/to/claude-code-upgrade-workflow` to migrate the data model
+> in `~/work/myapp`. Build is `npm run build`, tests are `npm test`. Plan it first so I can review the
+> breakdown."
 
-- **It uses git staging as the boundary.** Accepted work is `git add`-ed (the "known-good
-  baseline"); the current task's work-in-progress stays unstaged (what the reviewer scrutinises).
-  A later task that disturbs earlier accepted work shows up immediately in the diff.
-- **It never commits.** Every change lands **staged, not committed**. You review and commit.
-- **It only touches what the goal requires.** Pre-existing issues in untouched code are left alone
-  (run a normal code review for those) — so it won't "helpfully" rewrite your legacy logic.
+Claude finds `upgrade-cycle.mjs` in that folder and runs it **by path**. There is no global registry, so
+the folder pointer is how it is discovered.
+
+From there Claude drives everything:
+
+1. **Plans it.** Enters plan mode, greps the whole change surface, asks you the decisions that matter,
+   writes the plan as ordered sections, and presents it for your approval.
+2. **Reviews the plan.** An independent critic re-greps your real repo, verifies every section and its
+   wiring points and ordering, and returns any gaps. Claude folds them in, asking you about anything
+   blocking.
+3. **Runs it.** The develop → review → acceptance loop runs each section unattended, staging it on
+   acceptance and moving to the next. A whole-goal sweep checks coverage at the end.
+
+A workflow runs in the background and **cannot ask you questions mid-run**, so Claude settles anything
+needing a human answer while planning, before the run. Tip: have it run just the **first section** first
+(a `runOnly` slice) to sanity-check cost and quality before letting the rest go.
+
+---
+
+## The agents
+
+Each is a fresh, throwaway context that does one job and returns one decision:
+
+- **Plan critic** (plan review): adversarial and read-only. Re-greps the whole surface, verifies every
+  section's files, integration points, and ordering, returns gaps and blocking questions. Writes nothing.
+- **Developer** (run loop): implements one section, **converts every call site it owns** so the change is
+  reachable, runs your build and test gate, and leaves the work **unstaged**. Owns the call on every
+  review finding: fixes what is real, logs what it declines (with a reason to `DISMISSED-<id>.md`),
+  escalates only a decision you must make.
+- **Quality reviewer** (run loop): a **blind** code critic. Given no plan or goal, it reviews **only the
+  unstaged diff** for production-blocking defects. Must be clean before acceptance runs.
+- **Acceptance verifier** (run loop): the **plan-aware** section gate. Checks every acceptance criterion,
+  that the section is reachable, that its gate is met, and that nothing regressed against the staged
+  baseline. On pass it stages the section, and it is the only agent that stages.
+- **Sweep** (after the last section): an independent whole-goal check. Re-greps the surface, runs the full
+  gates, spot-checks the staged diff, and writes `SWEEP.md`.
+
+The loop is **develop → quality → acceptance**, repeated each round until acceptance passes. Any code
+change re-enters at the blind review. A section that does not accept halts the run, because the next
+section's diff must be clean; you resolve it and resume from that section.
+
+---
+
+## Reviewing the result
+
+Nothing is committed; everything is staged in your repo. Review it like a PR:
+
+```bash
+cd /path/to/repo
+git diff --cached            # everything staged
+<your build + test command>  # confirm green yourself
+```
+
+The run leaves a transparent trail under `runs/<runId>/`:
+
+- `acceptance-review-<id>-<N>.md`: the plan-aware verdict per section (criteria, reachability, regression,
+  gate result). Read the latest per section before committing.
+- `quality-review-<id>-<N>.md`: what the blind critic found each round.
+- `DISMISSED-<id>.md`: every finding the developer declined for that section, one line each with a reason.
+  **Audit these.**
+- `NEEDS-USER.md`: anything flagged for you. If a run stopped, the reason is here.
+- `SWEEP.md`: the final whole-goal coverage check (full-suite result plus any gaps).
+
+Confirm each section is reachable yourself (grep its integration points), run the gates, then commit.
 
 ---
 
 ## Requirements
 
-- **Claude Code** with the Workflow capability (this runs as a Claude Code *workflow*).
-- The target is a **git repository.** Staging is how regressions are caught — non-negotiable.
-- **A way to run the project's tests locally** — whatever your stack uses: `npm test`, `pytest`,
-  `cargo test`, `go test`, or a containerised runner like `docker exec … phpunit`. You provide the
-  exact commands; the workflow just runs them and reads pass/fail.
-- Ideally a **reference**: a sibling repo/module where a similar change was already done. The agents
-  mirror it. Optional but a big quality boost.
-
----
-
-## Using it in Claude Code
-
-### 1. Point Claude at this tool and include the word **“workflow”**
-
-The Workflow tool only activates when you opt in, so include **“workflow”** (or “workflows”) in
-your message. For example:
-
-> "Use the upgrade-cycle **workflow** in `~/tools/upgrade-cycle` to migrate `~/work/myapp`. Here's
-> the goal: … Start with the plan phase so I can review the breakdown."
-
-### 2. Write your config
-
-Copy `examples/TEMPLATE.json` and fill it in (see `examples/` for a TypeScript/Angular example and
-a PHP/docker example). The fields that matter most:
-
-| field | what it is |
-|------|------------|
-| `goal` | one detailed paragraph: what to change, why, what must NOT break, what "done" looks like |
-| `target.repo` | absolute path to the target **git** repo |
-| `root` | *(optional)* where run-state is written; **auto-detected** from the working directory if omitted |
-| `gates.build` / `gates.test` | the shell commands that compile/lint and run your tests |
-| `gates.testSetup` | notes: how to run ONE test, runner quirks, run-as-user, DB isolation |
-| `reference` | (optional) a completed example to mirror |
-| `seed` | (optional) a first-cut task list to steer the breakdown |
-
-### 3. Run the two phases
-
-- **Plan first.** Ask Claude to run the `plan` phase. It writes a proposed task list to
-  `runs/<runId>/tasks.json` (+ a readable `TASKS.md`) and **stops**. Review and edit it.
-- **Then run.** Ask Claude to run the `run` phase. Tip: have it run just the **first slice** first
-  (a `runOnly` subset) so you can sanity-check cost and quality before letting the rest go.
-
-Claude drives the `Workflow` tool for you — you mostly approve the plan, watch progress
-(`/workflows`), and review the result.
-
----
-
-## Reviewing the changes
-
-When a run finishes, **nothing is committed** — it's all staged in your target repo. Review it like
-a PR:
-
-```bash
-cd /path/to/target-repo
-git diff --cached            # everything the workflow staged
-git diff --cached --stat     # the file-level summary
-<your test command>          # confirm the suite is green yourself
-```
-
-Then check the run's reports under `runs/<runId>/`:
-
-- **`LEDGER.md`** — every task and its status.
-- **`NEEDS-DECISION.md`** — anything the workflow flagged for *you* (usually a business-logic call).
-  Read this before committing.
-- **`SWEEP.md`** — the final completeness sweep's verdict: full-suite result plus any goal-coverage
-  gaps it found (with file:line evidence). Written only when every task finished.
-- **`CHANGELOG.md`** — a human-readable summary of what changed.
-- **`BLOCKERS.md`** — only present if a run hard-stopped; explains why and how to resume.
-
-When you're satisfied: commit (you may want to unstage any local-only patches first). If you run a
-separate, general code-review pass before production, do it now — this workflow deliberately stays
-in scope and leaves broad cleanups to that pass.
-
----
-
-## How much does a run cost / how long?
-
-Each task is a full multi-agent cycle — expect roughly **250–350k tokens per task** and a few
-minutes each. Keep tasks right-sized (~1–6 files); the planner does this for you and will split
-anything too large. Use `runOnly` to checkpoint cheaply.
-
----
-
-## Reference
-
-- **`CLAUDE.md`** — the operator guide Claude follows when driving this (the deeper mechanics and
-  gotchas).
-- **`examples/`** — `TEMPLATE.json`, plus worked configs for an Angular upgrade and a PHP/docker
-  data-model migration.
-- **`upgrade-cycle.mjs`** — the engine. The top of the file documents every `args` field.
-
-### Config field reference
-
-| field | required | meaning |
-|------|:--:|---------|
-| `phase` | ✓ | `"plan"` (decompose + stop) or `"run"` (execute) |
-| `runId` | ✓ | names the state dir `runs/<runId>/` |
-| `goal` | ✓ | the prose objective |
-| `target` | ✓ | `{ repo, lang, framework }` — `repo` is the target git repo |
-| `gates` | ✓ | `{ build, test, testSetup }` — your stack's commands |
-| `root` |  | where state is written + base for relative paths; auto-detected from cwd if omitted |
-| `reference` |  | a completed example to mirror |
-| `conventions` |  | coding rules the reviewer judges against |
-| `seed` |  | first-cut task list (strings or task objects) |
-| `runOnly` |  | array of task ids — run a dependency-closed subset |
-| `baselineNote` |  | expected pre-existing working-tree changes to fold into the baseline |
-| `fixSeverity` / `reviewSeverity` |  | severity floors (default `high`) |
-| `maxRounds` / `maxResearch` |  | per-task fix-round / research caps (default 3 / 3) |
-| `planCritic` |  | independent coverage critique of the plan before approval (default `true`) |
-| `finalSweep` |  | post-run completeness sweep once all tasks are done (default `true`) |
-| `minTaskBudget` |  | with a token target set, stop cleanly between tasks below this remainder (default `150000`) |
-| `models` |  | per-role model tier (defaults: planner/develop `opus`, research/review/scribe `sonnet`) |
-| `agentTypes` |  | per-role custom subagent types — **only set ones that exist in your agent registry**; by default roles use the standard workflow subagent (research uses the built-in `Explore`) |
+- **Claude Code** with the Workflow capability.
+- The target is a **git repository** (staging is how regressions are caught).
+- Commands to **build and test** your project locally. You provide them; the workflow runs them and reads
+  pass/fail.
+- Optionally a **reference**: a sibling repo or module where a similar change was already done. The agents
+  mirror it. Optional but a quality boost.
